@@ -1,0 +1,34 @@
+# --- secrets ---
+.env
+.env.local
+.env.*.local
+session.json
+*.session
+session.b64
+*.b64
+
+# --- runtime / state (per-deploy, don't commit) ---
+backfill_state.json
+backfill_state.*.json
+matches.jsonl
+matches.*.jsonl
+
+# --- build artifacts ---
+/bin/
+/tmp/
+/dist/
+*.log
+*.test
+*.out
+coverage.*
+
+# --- editor / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# --- Go module cache (only meaningful when vendoring) ---
+/vendor/
