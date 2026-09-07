@@ -33,6 +33,7 @@ const (
 	defaultProfilePath    = "profile/candidate.md"
 	defaultMatchThreshold = 60
 	defaultPollStatePath  = "state.json"
+	defaultPollWorkers    = 4
 	defaultPollMaxRuntime = 20 * time.Minute
 
 	dateFmt = "2006-01-02"
@@ -88,6 +89,9 @@ type Config struct {
 	// and has no cursor yet. Zero means "start from the newest post".
 	PollBootstrapSince time.Time
 
+	// PollWorkers bounds how many channels are analysed concurrently.
+	PollWorkers int
+
 	// PollMaxRuntime bounds a single --once run. On expiry the poller saves
 	// its cursor and exits cleanly, so a long backlog is consumed across
 	// several scheduled runs instead of failing one oversized job.
@@ -119,6 +123,7 @@ func Load() (*Config, error) {
 		MaxMessageAge:       parseDurationSeconds(os.Getenv("MAX_MESSAGE_AGE_SECONDS"), 15*time.Minute),
 		PollStatePath:       getenvDefault("POLL_STATE_PATH", defaultPollStatePath),
 		PollMaxRuntime:      parseDuration(os.Getenv("POLL_MAX_RUNTIME"), defaultPollMaxRuntime),
+		PollWorkers:         parsePositiveInt(os.Getenv("POLL_WORKERS"), defaultPollWorkers),
 		MatchLogPath:        getenvDefault("MATCH_LOG_PATH", "matches.jsonl"),
 	}
 

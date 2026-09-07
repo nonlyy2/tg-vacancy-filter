@@ -213,6 +213,7 @@ Full list with comments in [`.env.example`](./.env.example). The ones that matte
 | `GEMINI_RPM`            |          | `12`                     | Client-side ceiling. `0` disables.                            |
 | `POLL_STATE_PATH`       |          | `state.json`             | Cursor + fingerprints. Must persist between runs.             |
 | `POLL_BOOTSTRAP_SINCE`  |          |                          | `YYYY-MM-DD` UTC; how far back a channel's first poll reaches.|
+| `POLL_WORKERS`          |          | `4`                      | Channels analysed concurrently; `GEMINI_RPM` still caps rate.  |
 | `POLL_MAX_RUNTIME`      |          | `20m`                    | Budget for one `-once` run.                                   |
 | `MATCH_LOG_PATH`        |          | `matches.jsonl`          | Empty disables. Contains source post text.                    |
 | `LOG_LEVEL`             |          | `info`                   | `debug` prints the score of every post, matched or not.       |
@@ -366,6 +367,11 @@ The bot only makes outbound calls, so no ingress rules are needed.
 - Notifications are paced 1.5s apart and retried once on `FLOOD_WAIT` — a
   bootstrap can produce dozens of matches back to back.
 - A channel that fails to fetch is logged and skipped; the run continues.
+- Channels are analysed `POLL_WORKERS` at a time. Model latency is not stable
+  — 6s and 42s per call were both observed on the same model within an hour —
+  and one slow call should not hold up 27 other channels. The rate limiter is
+  shared, so concurrency never raises the request rate, it only reclaims the
+  time that would otherwise be spent waiting.
 
 `LOG_LEVEL=debug` prints the score and reasoning for every post, including
 rejected ones. That is the tool for calibrating `MATCH_THRESHOLD` and the

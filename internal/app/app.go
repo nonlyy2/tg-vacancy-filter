@@ -103,7 +103,8 @@ func RunOnce(ctx context.Context, log *slog.Logger, dryRun bool) error {
 		}
 
 		deadline := time.Now().Add(e.cfg.PollMaxRuntime)
-		poller := tgclient.NewPoller(s.api, s.proc, e.cfg.PollStatePath, e.cfg.PollBootstrapSince, log)
+		poller := tgclient.NewPoller(s.api, s.proc, e.cfg.PollStatePath,
+			e.cfg.PollBootstrapSince, e.cfg.PollWorkers, log)
 		return poller.Run(ctx, sources, deadline)
 	})
 }

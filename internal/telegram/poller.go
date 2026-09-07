@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -29,8 +30,12 @@ const stateFlushEvery = 10
 // a post published mid-run is delivered within a couple of minutes.
 const idlePause = 2 * time.Minute
 
-// pollState is the cursor persisted between runs.
+// pollState is the cursor persisted between runs. Channels are analysed
+// concurrently, so every accessor takes mu — including Mark, which the
+// processor calls from whichever worker goroutine owns the post.
 type pollState struct {
+	mu sync.Mutex
+
 	// Channels maps channelID (as string so JSON doesn't rewrite int64 as
 	// float) to the highest message ID already analysed.
 	Channels map[string]int `json:"channels"`
@@ -40,6 +45,8 @@ type pollState struct {
 
 // Mark implements Seen.
 func (s *pollState) Mark(fingerprint string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.Seen[fingerprint]; ok {
 		return true
 	}
@@ -47,7 +54,34 @@ func (s *pollState) Mark(fingerprint string) bool {
 	return false
 }
 
+// advance moves a channel cursor forward, never backwards.
+func (s *pollState) advance(channelID int64, msgID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := strconv.FormatInt(channelID, 10)
+	if msgID > s.Channels[key] {
+		s.Channels[key] = msgID
+	}
+}
+
+// cursor reports the highest message ID already analysed for a channel.
+func (s *pollState) cursor(channelID int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Channels[strconv.FormatInt(channelID, 10)]
+}
+
+// marshal serialises the state under the lock, so a save concurrent with a
+// worker's cursor update cannot observe a half-written map.
+func (s *pollState) marshal() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.MarshalIndent(s, "", "  ")
+}
+
 func (s *pollState) prune(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cutoff := now.Add(-seenTTL).Unix()
 	for fp, ts := range s.Seen {
 		if ts < cutoff {
@@ -67,6 +101,13 @@ type Poller struct {
 	// polled, before it has a cursor. Zero means "start from now".
 	bootstrap time.Time
 
+	// workers bounds how many channels are analysed at once. The model's
+	// per-call latency swings by an order of magnitude (6s to 42s observed on
+	// the same model), and strictly sequential processing lets one slow call
+	// stall the whole run. The shared rate limiter still caps total RPM, so
+	// concurrency only buys back the time otherwise spent waiting.
+	workers int
+
 	log *slog.Logger
 }
 
@@ -76,9 +117,20 @@ func NewPoller(
 	proc *Processor,
 	statePath string,
 	bootstrap time.Time,
+	workers int,
 	log *slog.Logger,
 ) *Poller {
-	return &Poller{api: api, proc: proc, statePath: statePath, bootstrap: bootstrap, log: log}
+	if workers < 1 {
+		workers = 1
+	}
+	return &Poller{
+		api:       api,
+		proc:      proc,
+		statePath: statePath,
+		bootstrap: bootstrap,
+		workers:   workers,
+		log:       log,
+	}
 }
 
 // pendingPost is one message waiting to be classified, tagged with the channel
@@ -146,50 +198,90 @@ func (p *Poller) pass(
 		return false, p.saveState(state)
 	}
 
-	// Process oldest-first across all channels so a truncated run spends its
-	// budget evenly instead of finishing channel #1 and never reaching #16.
-	sort.Slice(pending, func(i, j int) bool {
-		if pending[i].msg.Date != pending[j].msg.Date {
-			return pending[i].msg.Date < pending[j].msg.Date
-		}
-		return pending[i].msg.ID < pending[j].msg.ID
-	})
-	p.log.Info("poll: analysing", slog.Int("pending", len(pending)))
-
-	counts := map[Outcome]int{}
-	processed := 0
-	budgetSpent := false
-
+	// Group by channel: a channel's posts must be analysed in ID order so the
+	// cursor only ever moves over work that is actually done. Channels are
+	// independent, so they run in parallel.
+	byChannel := make(map[int64][]pendingPost, len(sources))
 	for _, post := range pending {
-		if err := ctx.Err(); err != nil {
-			_ = p.saveState(state)
-			return true, err
-		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			budgetSpent = true
-			break
-		}
+		byChannel[post.channelID] = append(byChannel[post.channelID], post)
+	}
+	for _, posts := range byChannel {
+		sort.Slice(posts, func(i, j int) bool { return posts[i].msg.ID < posts[j].msg.ID })
+	}
+	p.log.Info("poll: analysing",
+		slog.Int("pending", len(pending)),
+		slog.Int("channels", len(byChannel)),
+		slog.Int("workers", p.workers))
 
-		outcome, err := p.proc.Process(ctx, post.channel, post.msg.ID,
-			strings.TrimSpace(post.msg.Message), "poll")
-		if err != nil {
-			_ = p.saveState(state)
-			return true, err
-		}
-		counts[outcome]++
+	var (
+		mu          sync.Mutex
+		counts      = map[Outcome]int{}
+		processed   int
+		budgetSpent bool
+		fatal       error
+		wg          sync.WaitGroup
+	)
+	sem := make(chan struct{}, p.workers)
 
-		// An operational failure must not advance the cursor — the post is
-		// retried on the next run.
-		if outcome != OutcomeError {
-			p.advance(state, post.channelID, post.msg.ID)
-		}
+	for id, posts := range byChannel {
+		wg.Add(1)
+		go func(id int64, posts []pendingPost) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		processed++
-		if processed%stateFlushEvery == 0 {
-			if err := p.saveState(state); err != nil {
-				p.log.Warn("poll: save state failed", slog.Any("err", err))
+			for _, post := range posts {
+				mu.Lock()
+				stop := fatal != nil || budgetSpent
+				mu.Unlock()
+				if stop {
+					return
+				}
+				if err := ctx.Err(); err != nil {
+					mu.Lock()
+					fatal = err
+					mu.Unlock()
+					return
+				}
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					mu.Lock()
+					budgetSpent = true
+					mu.Unlock()
+					return
+				}
+
+				outcome, err := p.proc.Process(ctx, post.channel, post.msg.ID,
+					strings.TrimSpace(post.msg.Message), "poll")
+
+				mu.Lock()
+				if err != nil {
+					fatal = err
+					mu.Unlock()
+					return
+				}
+				counts[outcome]++
+				// An operational failure must not advance the cursor — the
+				// post is retried on the next run.
+				if outcome != OutcomeError {
+					state.advance(id, post.msg.ID)
+				}
+				processed++
+				flush := processed%stateFlushEvery == 0
+				mu.Unlock()
+
+				if flush {
+					if err := p.saveState(state); err != nil {
+						p.log.Warn("poll: save state failed", slog.Any("err", err))
+					}
+				}
 			}
-		}
+		}(id, posts)
+	}
+	wg.Wait()
+
+	if fatal != nil {
+		_ = p.saveState(state)
+		return true, fatal
 	}
 
 	if err := p.saveState(state); err != nil {
@@ -227,7 +319,7 @@ func (p *Poller) collect(
 			return nil, err
 		}
 		resolved := sources[id]
-		lastSeen := state.Channels[strconv.FormatInt(id, 10)]
+		lastSeen := state.cursor(id)
 
 		var (
 			msgs []*tg.Message
@@ -255,7 +347,7 @@ func (p *Poller) collect(
 			if strings.TrimSpace(m.Message) == "" {
 				// Media without a caption carries nothing to classify, but the
 				// cursor must still move past it.
-				p.advance(state, id, m.ID)
+				state.advance(id, m.ID)
 				continue
 			}
 			pending = append(pending, pendingPost{channelID: id, channel: resolved.Channel, msg: m})
@@ -267,14 +359,6 @@ func (p *Poller) collect(
 			slog.Int("cursor", lastSeen))
 	}
 	return pending, nil
-}
-
-// advance moves a channel cursor forward, never backwards.
-func (p *Poller) advance(state *pollState, channelID int64, msgID int) {
-	key := strconv.FormatInt(channelID, 10)
-	if msgID > state.Channels[key] {
-		state.Channels[key] = msgID
-	}
 }
 
 func (p *Poller) loadState() (*pollState, error) {
@@ -300,7 +384,7 @@ func (p *Poller) loadState() (*pollState, error) {
 }
 
 func (p *Poller) saveState(s *pollState) error {
-	raw, err := json.MarshalIndent(s, "", "  ")
+	raw, err := s.marshal()
 	if err != nil {
 		return err
 	}
