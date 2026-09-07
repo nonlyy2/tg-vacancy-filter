@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -163,28 +164,30 @@ func (v Verdict) Matches(threshold int) bool {
 type Analyzer struct {
 	client *genai.Client
 
-	primary      *genai.GenerativeModel
-	primaryName  string
-	fallback     *genai.GenerativeModel
-	fallbackName string
+	// models is the primary followed by the fallback chain. Quotas are
+	// per-model, so a second model is a second daily allowance — and the
+	// order matters for speed as much as for quota: a big fallback model
+	// costs ~45s per post where a lite one costs ~5s.
+	models []*genai.GenerativeModel
+	names  []string
 
 	limiter *rate.Limiter
 	prompt  string
 
-	// mu guards usingFallback, which flips once per process and is read on
-	// every Analyze call — the backfill path may run concurrently with live
-	// updates.
-	mu            sync.Mutex
-	usingFallback bool
+	// mu guards idx, which only ever moves forward and is read on every
+	// Analyze call — the poller and the live handler may run concurrently.
+	mu  sync.Mutex
+	idx int
 
 	onRetry    func(attempt int, wait time.Duration, err error)
 	onFallback func(from, to string)
 }
 
 // New constructs an Analyzer. profile is the candidate description injected
-// into the prompt. fallbackModel may be empty to disable quota failover.
+// into the prompt. fallbackModels is a comma-separated chain tried in order
+// as each preceding model's quota runs out; empty disables failover.
 // rpm is the request-per-minute ceiling; 0 disables the limiter.
-func New(ctx context.Context, apiKey, modelName, fallbackModel, profile string, rpm int) (*Analyzer, error) {
+func New(ctx context.Context, apiKey, modelName, fallbackModels, profile string, rpm int) (*Analyzer, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, errors.New("gemini: api key is empty")
 	}
@@ -197,14 +200,16 @@ func New(ctx context.Context, apiKey, modelName, fallbackModel, profile string, 
 	}
 
 	a := &Analyzer{
-		client:      client,
-		primaryName: modelName,
-		prompt:      instructions + "\n\n=== ПРОФИЛЬ КАНДИДАТА ===\n" + strings.TrimSpace(profile),
+		client: client,
+		prompt: instructions + "\n\n=== ПРОФИЛЬ КАНДИДАТА ===\n" + strings.TrimSpace(profile),
 	}
-	a.primary = a.newModel(modelName)
-	if fallbackModel != "" && fallbackModel != modelName {
-		a.fallbackName = fallbackModel
-		a.fallback = a.newModel(fallbackModel)
+	for _, name := range append([]string{modelName}, strings.Split(fallbackModels, ",")...) {
+		name = strings.TrimSpace(name)
+		if name == "" || slices.Contains(a.names, name) {
+			continue
+		}
+		a.names = append(a.names, name)
+		a.models = append(a.models, a.newModel(name))
 	}
 
 	if rpm > 0 {
@@ -290,10 +295,7 @@ func (a *Analyzer) SetFallbackHook(fn func(from, to string)) {
 func (a *Analyzer) Model() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.usingFallback {
-		return a.fallbackName
-	}
-	return a.primaryName
+	return a.names[a.idx]
 }
 
 // Analyze scores one post. It blocks on the rate limiter, retries up to
@@ -332,7 +334,7 @@ func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error
 		// Either the retry budget is spent, or the server is telling us this
 		// is a wall rather than a burst. Both mean: stop waiting on this model.
 		if attempt >= maxRetries429 || wait >= quotaWallHint {
-			if !a.switchToFallback() {
+			if !a.switchToFallback(name) {
 				if attempt >= maxRetries429 {
 					return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
 				}
@@ -402,22 +404,20 @@ func (a *Analyzer) buildInput(modelName, postText string) string {
 func (a *Analyzer) current() (*genai.GenerativeModel, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.usingFallback {
-		return a.fallback, a.fallbackName
-	}
-	return a.primary, a.primaryName
+	return a.models[a.idx], a.names[a.idx]
 }
 
-// switchToFallback flips to the fallback model. Returns false when there is no
-// fallback configured or the switch already happened.
-func (a *Analyzer) switchToFallback() bool {
+// switchToFallback advances to the next model in the chain. Returns false once
+// the chain is exhausted. Concurrent callers that hit the same wall collapse
+// into one advance, because idx is compared against the model they were using.
+func (a *Analyzer) switchToFallback(spent string) bool {
 	a.mu.Lock()
-	if a.fallback == nil || a.usingFallback {
+	if a.names[a.idx] != spent || a.idx+1 >= len(a.models) {
 		a.mu.Unlock()
-		return false
+		return a.names[a.idx] != spent // someone else already advanced
 	}
-	a.usingFallback = true
-	from, to := a.primaryName, a.fallbackName
+	a.idx++
+	from, to := spent, a.names[a.idx]
 	a.mu.Unlock()
 
 	if a.onFallback != nil {

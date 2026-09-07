@@ -100,8 +100,10 @@ func checkGemini(ctx context.Context, cfg *config.Config) {
 		available[m] = true
 	}
 	reportModel("primary ", cfg.GeminiModel, available)
-	if cfg.GeminiModelFallback != "" {
-		reportModel("fallback", cfg.GeminiModelFallback, available)
+	for _, name := range strings.Split(cfg.GeminiModelFallback, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			reportModel("fallback", name, available)
+		}
 	}
 
 	fmt.Println("  candidates:")

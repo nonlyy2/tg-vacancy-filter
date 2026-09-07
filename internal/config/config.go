@@ -23,8 +23,11 @@ const (
 	// what keeps verdict parsing deterministic. Gemma is kept as the fallback
 	// because its free-tier RPD (~14400) is an order of magnitude higher, so
 	// it can absorb a bootstrap sweep after the primary model's daily cap.
-	defaultModel         = "gemini-3.5-flash-lite"
-	defaultModelFallback = "gemma-4-26b-a4b-it"
+	defaultModel = "gemini-3.5-flash-lite"
+	// Fallback chain, tried in order. Quotas are per model, so each entry is
+	// another daily allowance. Order is by speed: the lite models answer in
+	// ~5s, Gemma in ~45s, so Gemma is the last resort rather than the first.
+	defaultModelFallback = "gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemma-4-26b-a4b-it"
 	defaultGeminiRPM     = 12
 
 	defaultProfilePath    = "profile/candidate.md"
@@ -56,8 +59,8 @@ type Config struct {
 	GeminiAPIKey string
 	GeminiModel  string
 
-	// GeminiModelFallback takes over for the rest of the run once the primary
-	// model's quota is exhausted. Empty disables the switch.
+	// GeminiModelFallback is a comma-separated chain of models tried in order
+	// as each preceding one's quota runs out. Empty disables failover.
 	GeminiModelFallback string
 
 	// GeminiRPM caps the request rate. Zero disables rate limiting.

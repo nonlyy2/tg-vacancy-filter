@@ -209,7 +209,7 @@ Full list with comments in [`.env.example`](./.env.example). The ones that matte
 | `PROFILE_PATH`          |          | `profile/candidate.md`   | The candidate description injected into the prompt.           |
 | `MATCH_THRESHOLD`       |          | `60`                     | Minimum score to forward.                                     |
 | `GEMINI_MODEL`          |          | `gemini-3.5-flash-lite`  | Verify with `-doctor`; the free lineup changes.               |
-| `GEMINI_MODEL_FALLBACK` |          | `gemma-4-26b-a4b-it`     | Takes over when the primary's daily quota runs out.           |
+| `GEMINI_MODEL_FALLBACK` |          | chain, see below         | Comma-separated models tried as each quota runs out.          |
 | `GEMINI_RPM`            |          | `12`                     | Client-side ceiling. `0` disables.                            |
 | `POLL_STATE_PATH`       |          | `state.json`             | Cursor + fingerprints. Must persist between runs.             |
 | `POLL_BOOTSTRAP_SINCE`  |          |                          | `YYYY-MM-DD` UTC; how far back a channel's first poll reaches.|
@@ -230,11 +230,21 @@ is what lets a long backlog finish after the primary model's cap is hit).
 
 **Free-tier caps are per model and vary wildly.** `gemini-2.5-flash-lite`
 allows 20 requests *per day*; a newer sibling such as `gemini-3.5-flash-lite`
-has its own, far larger allowance. If a run stalls in backoff immediately,
-that model is spent — switch to another from the `-doctor` list rather than
-lowering `GEMINI_RPM`. A 429 whose retry hint exceeds 30s is treated as a
-quota wall and trips the fallback at once instead of sleeping through three
-retries.
+has its own, far larger allowance. A 429 whose retry hint exceeds 30s is
+treated as a quota wall and advances the chain at once instead of sleeping
+through three retries.
+
+`GEMINI_MODEL_FALLBACK` is therefore a **chain**, not one model:
+
+```
+GEMINI_MODEL=gemini-3.5-flash-lite
+GEMINI_MODEL_FALLBACK=gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemma-4-26b-a4b-it
+```
+
+Each entry is another daily allowance. Order by **speed**, not size: the lite
+models answer in ~5s, Gemma in ~45s. A run that falls through to Gemma
+processes roughly nine times fewer posts in the same time budget, so Gemma
+belongs at the end of the chain as a last resort.
 
 ---
 
