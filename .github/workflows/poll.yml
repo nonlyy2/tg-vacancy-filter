@@ -21,10 +21,15 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 18m poll + build, plus headroom for the re-arm floor.
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Record start time
+        id: started
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
@@ -34,6 +39,7 @@ jobs:
         run: go build -o bot .
 
       - name: Poll channels
+        id: poll
         env:
           TG_APP_ID: ${{ secrets.TG_APP_ID }}
           TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
@@ -58,6 +64,7 @@ jobs:
         run: ./bot --once
 
       - name: Persist poll cursor
+        id: persist
         # Runs even when the poll step failed: partial progress is still worth
         # keeping, and the commit is what keeps the schedule from being
         # disabled after 60 days of repository inactivity.
@@ -73,3 +80,32 @@ jobs:
           git commit -m "chore: update poll cursor"
           git pull --rebase --autostash
           git push
+
+      - name: Re-arm the next run
+        # GitHub's schedule trigger proved unreliable on this repository, so a
+        # run queues its own successor. GITHUB_TOKEN cannot do this — GitHub
+        # blocks it from triggering workflows to prevent recursion — hence a
+        # PAT. Without the secret this is a no-op and the schedule is the only
+        # trigger left.
+        #
+        # Guarded twice against a runaway loop: skipped when the poll step
+        # never ran (a broken build must stop the chain, not spin on it), and
+        # floored to a minimum cycle so a fast-failing poll cannot re-arm more
+        # than a few times an hour.
+        if: always() && steps.poll.conclusion != 'skipped'
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          MIN_CYCLE_SECONDS: "600"
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "DISPATCH_TOKEN not set — relying on the schedule trigger only"
+            exit 0
+          fi
+          elapsed=$(( $(date +%s) - ${{ steps.started.outputs.at }} ))
+          if [ "$elapsed" -lt "$MIN_CYCLE_SECONDS" ]; then
+            wait=$(( MIN_CYCLE_SECONDS - elapsed ))
+            echo "run took ${elapsed}s; waiting ${wait}s to keep the cycle sane"
+            sleep "$wait"
+          fi
+          gh workflow run poll.yml --repo "$GITHUB_REPOSITORY"
+          echo "next run queued"

@@ -23,6 +23,12 @@ const seenTTL = 30 * 24 * time.Hour
 // where it stopped instead of re-analysing everything.
 const stateFlushEvery = 10
 
+// idlePause is how long the poller waits before re-checking the channels when
+// a pass found nothing. It keeps a run doing real work for its whole budget
+// instead of exiting immediately and leaving the caller to idle, and it means
+// a post published mid-run is delivered within a couple of minutes.
+const idlePause = 2 * time.Minute
+
 // pollState is the cursor persisted between runs.
 type pollState struct {
 	// Channels maps channelID (as string so JSON doesn't rewrite int64 as
@@ -99,13 +105,45 @@ func (p *Poller) Run(
 	state.prune(time.Now())
 	p.proc.SetSeen(state)
 
+	// Keep polling for the whole budget rather than exiting on the first empty
+	// pass: the caller schedules runs, not passes, and a post published a
+	// minute after the run started should not wait for the next one.
+	for {
+		done, err := p.pass(ctx, sources, state, deadline)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(idlePause):
+		}
+	}
+}
+
+// pass runs one fetch-and-analyse cycle. done is true when the time budget is
+// spent and the caller should stop.
+func (p *Poller) pass(
+	ctx context.Context,
+	sources map[int64]ResolvedChannel,
+	state *pollState,
+	deadline time.Time,
+) (bool, error) {
+	if !deadline.IsZero() && time.Now().Add(idlePause).After(deadline) {
+		// Not enough budget left for another meaningful cycle.
+		return true, p.saveState(state)
+	}
+
 	pending, err := p.collect(ctx, sources, state)
 	if err != nil {
-		return err
+		return true, err
 	}
 	if len(pending) == 0 {
 		p.log.Info("poll: nothing new")
-		return p.saveState(state)
+		return false, p.saveState(state)
 	}
 
 	// Process oldest-first across all channels so a truncated run spends its
@@ -125,7 +163,7 @@ func (p *Poller) Run(
 	for _, post := range pending {
 		if err := ctx.Err(); err != nil {
 			_ = p.saveState(state)
-			return err
+			return true, err
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			budgetSpent = true
@@ -136,7 +174,7 @@ func (p *Poller) Run(
 			strings.TrimSpace(post.msg.Message), "poll")
 		if err != nil {
 			_ = p.saveState(state)
-			return err
+			return true, err
 		}
 		counts[outcome]++
 
@@ -155,10 +193,10 @@ func (p *Poller) Run(
 	}
 
 	if err := p.saveState(state); err != nil {
-		return err
+		return true, err
 	}
 
-	p.log.Info("poll: done",
+	p.log.Info("poll: pass done",
 		slog.Int("processed", processed),
 		slog.Int("remaining", len(pending)-processed),
 		slog.Int("matched", counts[OutcomeMatched]),
@@ -169,9 +207,9 @@ func (p *Poller) Run(
 		slog.Bool("budget_exhausted", budgetSpent),
 	)
 	if budgetSpent {
-		p.log.Info("poll: time budget spent — the next scheduled run continues from the saved cursor")
+		p.log.Info("poll: time budget spent — the next run continues from the saved cursor")
 	}
-	return nil
+	return budgetSpent, nil
 }
 
 // collect fetches the unprocessed posts of every source channel. A channel

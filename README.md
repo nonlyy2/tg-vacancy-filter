@@ -303,6 +303,22 @@ gh workflow run poll.yml     # first run, then watch it
 gh run watch
 ```
 
+**The schedule alone is not reliable.** On this repository GitHub skipped four
+consecutive scheduled slots across two different cron expressions while manual
+dispatches ran instantly — a known behaviour for schedules recently added to a
+repository that had been dormant. So each run queues its successor:
+
+```bash
+# fine-grained PAT, this repository only, permission: Actions -> Read and write
+gh secret set DISPATCH_TOKEN
+```
+
+`GITHUB_TOKEN` cannot do this — GitHub blocks it from triggering workflows to
+prevent recursion — which is why a PAT is required. Without the secret the
+re-arm step is a no-op and the schedule is the only trigger. The chain stops
+by itself if the build breaks, and a minimum cycle time keeps a fast-failing
+run from re-arming in a tight loop.
+
 Design notes:
 
 - **Only `schedule` and `workflow_dispatch` triggers.** A `pull_request`
