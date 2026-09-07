@@ -304,7 +304,9 @@ Design notes:
 - **`MATCH_LOG_PATH=""`** in the workflow: `matches.jsonl` contains the full
   text of source posts and has no business in a public repository.
 - Cron is best-effort; a delayed or skipped run loses nothing, because the
-  cursor decides what is new, not the clock.
+  cursor decides what is new, not the clock. The schedule deliberately avoids
+  `:00` and `:30` — GitHub's scheduler is busiest there and drops runs queued
+  at those minutes (observed: three consecutive slots skipped on `*/30`).
 
 ### Alternative: always-on VM
 

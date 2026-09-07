@@ -2,9 +2,11 @@ name: poll
 
 on:
   schedule:
-    # Every 30 minutes. Cron on GitHub is best-effort and can be delayed under
-    # load — the message cursor in state.json makes a skipped run harmless.
-    - cron: "*/30 * * * *"
+    # Every 30 minutes, deliberately off the hour. GitHub's scheduler is
+    # busiest at :00 and :30 and quietly drops runs queued there — three
+    # slots in a row were skipped on "*/30". Odd minutes get served.
+    # Still best-effort: the cursor in state.json makes a skipped run harmless.
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 # Only schedule and manual triggers: a pull_request trigger would expose the
