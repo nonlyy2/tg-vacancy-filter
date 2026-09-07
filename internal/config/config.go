@@ -15,16 +15,24 @@ import (
 
 // Destination kinds the bot knows how to resolve.
 const (
-	DestSelf         = "me"
-	DestSelfAlt      = "self"
-	MinPhoneLen      = 6
-	// Gemma 4 inherits the Gemma free-tier caps (30 RPM / 14400 RPD), which
-	// is what makes it usable for multi-thousand-message backfills. Gemini
-	// 2.5 Flash Lite gives stricter JSON but only ~1000 RPD on free tier —
-	// override GEMINI_MODEL when you need that.
-	defaultModel     = "gemma-4-26b-a4b-it"
-	defaultGeminiRPM = 25 // safe margin below the 30 RPM free-tier cap for Gemma
-	backfillDateFmt  = "2006-01-02"
+	DestSelf    = "me"
+	DestSelfAlt = "self"
+	MinPhoneLen = 6
+
+	// Gemini-family models enforce the response schema server-side, which is
+	// what keeps verdict parsing deterministic. Gemma is kept as the fallback
+	// because its free-tier RPD (~14400) is an order of magnitude higher, so
+	// it can absorb a bootstrap sweep after the primary model's daily cap.
+	defaultModel         = "gemini-2.5-flash-lite"
+	defaultModelFallback = "gemma-4-26b-a4b-it"
+	defaultGeminiRPM     = 12
+
+	defaultProfilePath    = "profile/candidate.md"
+	defaultMatchThreshold = 65
+	defaultPollStatePath  = "state.json"
+	defaultPollMaxRuntime = 20 * time.Minute
+
+	dateFmt = "2006-01-02"
 )
 
 // Config holds all runtime settings.
@@ -34,34 +42,56 @@ type Config struct {
 	Phone       string
 	SessionPath string
 
+	// StringSession is a Telethon-format StringSession. When set (and no
+	// session file exists yet) the bot authenticates without a terminal,
+	// which is what makes unattended hosts possible.
+	StringSession string
+
 	// SourceChannels contains unmarked (positive) channel IDs that the bot watches.
 	SourceChannels map[int64]struct{}
 
-	// Destination is either "me"/"self" or a username (with or without @).
+	// Destination is either "me"/"self", a username, or an invite link.
 	Destination string
 
 	GeminiAPIKey string
 	GeminiModel  string
 
-	// GeminiRPM caps the request rate. Gemini free tier is currently 15 RPM.
-	// Zero disables rate limiting.
+	// GeminiModelFallback takes over for the rest of the run once the primary
+	// model's quota is exhausted. Empty disables the switch.
+	GeminiModelFallback string
+
+	// GeminiRPM caps the request rate. Zero disables rate limiting.
 	GeminiRPM int
 
-	// MaxMessageAge is the cutoff applied to incoming posts; older messages are
-	// skipped so a backlog is not re-processed after downtime. Zero disables the check.
+	// ProfilePath points at the markdown file describing the candidate. Its
+	// contents are injected into the prompt, so retuning the filter is an
+	// edit to that file rather than a code change.
+	ProfilePath string
+
+	// MatchThreshold is the minimum score (0-100) a post must reach to be
+	// forwarded.
+	MatchThreshold int
+
+	// MaxMessageAge is the cutoff applied to incoming live posts; older
+	// messages are skipped so a burst of missed updates after a reconnect is
+	// not re-processed. Zero disables the check. Live mode only.
 	MaxMessageAge time.Duration
 
-	// BackfillSince, when non-zero, triggers a one-time history sweep of every
-	// source channel starting from this date. Matches are sent to the
-	// destination just like live updates.
-	BackfillSince time.Time
+	// PollStatePath stores per-channel cursors and seen-post fingerprints for
+	// the --once mode.
+	PollStatePath string
 
-	// BackfillStatePath stores per-channel progress so restarts don't
-	// re-analyse messages already sent through Gemini.
-	BackfillStatePath string
+	// PollBootstrapSince is the cutoff used the first time a channel is polled
+	// and has no cursor yet. Zero means "start from the newest post".
+	PollBootstrapSince time.Time
 
-	// MatchLogPath is the JSONL file where every match=true verdict is
-	// appended. Empty disables the log.
+	// PollMaxRuntime bounds a single --once run. On expiry the poller saves
+	// its cursor and exits cleanly, so a long backlog is consumed across
+	// several scheduled runs instead of failing one oversized job.
+	PollMaxRuntime time.Duration
+
+	// MatchLogPath is the JSONL file where every match is appended. Empty
+	// disables the log.
 	MatchLogPath string
 
 	LogLevel slog.Level
@@ -74,22 +104,37 @@ func Load() (*Config, error) {
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		SessionPath:       getenvDefault("SESSION_PATH", "session.json"),
-		GeminiModel:       getenvDefault("GEMINI_MODEL", defaultModel),
-		GeminiRPM:         parsePositiveInt(os.Getenv("GEMINI_RPM"), defaultGeminiRPM),
-		Destination:       strings.TrimPrefix(strings.TrimSpace(os.Getenv("DESTINATION")), "@"),
-		LogLevel:          parseLogLevel(os.Getenv("LOG_LEVEL")),
-		MaxMessageAge:     parseDurationSeconds(os.Getenv("MAX_MESSAGE_AGE_SECONDS"), 15*time.Minute),
-		BackfillStatePath: getenvDefault("BACKFILL_STATE_PATH", "backfill_state.json"),
-		MatchLogPath:      getenvDefault("MATCH_LOG_PATH", "matches.jsonl"),
+		SessionPath:         getenvDefault("SESSION_PATH", "session.json"),
+		StringSession:       strings.TrimSpace(os.Getenv("TG_STRING_SESSION")),
+		GeminiModel:         getenvDefault("GEMINI_MODEL", defaultModel),
+		GeminiModelFallback: getenvDefault("GEMINI_MODEL_FALLBACK", defaultModelFallback),
+		GeminiRPM:           parsePositiveInt(os.Getenv("GEMINI_RPM"), defaultGeminiRPM),
+		Destination:         strings.TrimPrefix(strings.TrimSpace(os.Getenv("DESTINATION")), "@"),
+		LogLevel:            parseLogLevel(os.Getenv("LOG_LEVEL")),
+		ProfilePath:         getenvDefault("PROFILE_PATH", defaultProfilePath),
+		MatchThreshold:      parsePositiveInt(os.Getenv("MATCH_THRESHOLD"), defaultMatchThreshold),
+		MaxMessageAge:       parseDurationSeconds(os.Getenv("MAX_MESSAGE_AGE_SECONDS"), 15*time.Minute),
+		PollStatePath:       getenvDefault("POLL_STATE_PATH", defaultPollStatePath),
+		PollMaxRuntime:      parseDuration(os.Getenv("POLL_MAX_RUNTIME"), defaultPollMaxRuntime),
+		MatchLogPath:        getenvDefault("MATCH_LOG_PATH", "matches.jsonl"),
 	}
 
-	if sinceRaw := strings.TrimSpace(os.Getenv("BACKFILL_SINCE")); sinceRaw != "" {
-		t, err := time.ParseInLocation(backfillDateFmt, sinceRaw, time.UTC)
+	// MATCH_LOG_PATH is deliberately allowed to be empty (disabled), which
+	// getenvDefault cannot express — re-read it directly.
+	if _, set := os.LookupEnv("MATCH_LOG_PATH"); set {
+		cfg.MatchLogPath = strings.TrimSpace(os.Getenv("MATCH_LOG_PATH"))
+	}
+
+	if cfg.MatchThreshold > 100 {
+		return nil, fmt.Errorf("MATCH_THRESHOLD must be 0-100, got %d", cfg.MatchThreshold)
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("POLL_BOOTSTRAP_SINCE")); raw != "" {
+		t, err := time.ParseInLocation(dateFmt, raw, time.UTC)
 		if err != nil {
-			return nil, fmt.Errorf("BACKFILL_SINCE must be YYYY-MM-DD: %w", err)
+			return nil, fmt.Errorf("POLL_BOOTSTRAP_SINCE must be YYYY-MM-DD: %w", err)
 		}
-		cfg.BackfillSince = t
+		cfg.PollBootstrapSince = t
 	}
 
 	appIDStr := os.Getenv("TG_APP_ID")
@@ -158,6 +203,17 @@ func (c *Config) IsSelfDestination() bool {
 	return d == DestSelf || d == DestSelfAlt
 }
 
+// ParseChannelID recognises a destination given as a numeric channel id, in
+// either the marked (-100xxxxxxxxxx) or raw form, and returns the unmarked id
+// used by MTProto.
+func ParseChannelID(s string) (int64, bool) {
+	id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return normalizeChannelID(id), true
+}
+
 // normalizeChannelID converts the marked form -100xxxx to the unmarked form used
 // by MTProto updates. Positive IDs are returned unchanged.
 func normalizeChannelID(id int64) int64 {
@@ -202,6 +258,21 @@ func parseDurationSeconds(raw string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(n) * time.Second
+}
+
+// parseDuration reads a Go duration string ("20m", "90s"). Invalid or negative
+// values fall back rather than failing the boot — a bad budget should not take
+// the scheduled run down with it.
+func parseDuration(raw string, fallback time.Duration) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 func parsePositiveInt(raw string, fallback int) int {

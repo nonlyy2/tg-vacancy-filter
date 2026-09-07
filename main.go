@@ -1,10 +1,11 @@
-// Command tg-vacancy-filter runs the Telegram userbot that filters channel
-// posts through Gemini and forwards matches to a destination chat.
+// Command tg-vacancy-filter runs the Telegram userbot that scores channel
+// posts against a candidate profile and forwards the matches.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,6 +18,14 @@ import (
 )
 
 func main() {
+	once := flag.Bool("once", false,
+		"poll every source channel once and exit (used by the scheduled deploy)")
+	doctor := flag.Bool("doctor", false,
+		"run preflight checks (api key, account, channels, destination) and exit")
+	doctorSend := flag.Bool("doctor-send", false,
+		"with -doctor: also send a test message to DESTINATION to prove write access")
+	flag.Parse()
+
 	// Load .env BEFORE parsing LOG_LEVEL — otherwise the logger is initialised
 	// from an empty process env and LOG_LEVEL=debug in .env gets silently
 	// ignored. godotenv.Load never overwrites existing env vars, so a second
@@ -32,7 +41,17 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := app.Run(ctx, log); err != nil && !errors.Is(err, context.Canceled) {
+	var err error
+	switch {
+	case *doctor:
+		err = app.Doctor(ctx, log, *doctorSend)
+	case *once:
+		err = app.RunOnce(ctx, log)
+	default:
+		err = app.Run(ctx, log)
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("fatal", slog.Any("err", err))
 		os.Exit(1)
 	}

@@ -1,6 +1,5 @@
-// Package gemini wraps the Google Generative AI SDK with a small, opinionated
-// analyser that classifies Telegram posts as "matching" or "not matching" a
-// fixed candidate profile.
+// Package gemini wraps the Google Generative AI SDK with an analyser that
+// scores Telegram job posts against a candidate profile loaded from disk.
 package gemini
 
 import (
@@ -11,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/generative-ai-go/genai"
@@ -19,220 +19,205 @@ import (
 	"google.golang.org/api/option"
 )
 
-// maxRetries429 bounds how many times Analyze retries on RESOURCE_EXHAUSTED.
-// The limiter prevents 429s steady-state; this only protects against short
-// bursts and slight quota-accounting skew at the Google edge.
+// maxRetries429 bounds how many times Analyze retries one model on
+// RESOURCE_EXHAUSTED before giving up (or switching to the fallback model).
 const maxRetries429 = 3
+
+// Remote formats the model is asked to classify a post into.
+const (
+	RemoteYes     = "remote"
+	RemoteHybrid  = "hybrid"
+	RemoteOnsite  = "onsite"
+	RemoteUnknown = "unknown"
+)
 
 // retryAfterRe pulls the "retry in 38.341s" hint out of the googleapi error
 // message. The SDK also exposes this via googleapi.Error.Details, but parsing
 // the structured proto is heavier than a regex over the already-formatted text.
 var retryAfterRe = regexp.MustCompile(`retry in (\d+(?:\.\d+)?)s`)
 
-// decisionRules is the candidate brief + rule list, shared by both output
-// formats. Hard-reject rules come first as a checklist — Gemma 4 is weak at
-// nuanced instruction-following and tends to over-apply "lean toward match"
-// guidance to obviously off-target posts (analyst roles, UX writer, etc.)
-// when the rejection criteria are buried below the inclusion ones.
-const decisionRules = `You are an HR assistant filtering Telegram posts for one specific candidate.
-Posts are in Russian, Kazakh, or English — treat them equally.
+// instructions is the task description. The candidate-specific part is not
+// here — it is loaded from PROFILE_PATH and appended at construction, so
+// retuning the filter never means editing Go code.
+const instructions = `Ты — ассистент по поиску работы. Оцениваешь, насколько пост из
+Telegram-канала подходит одному конкретному кандидату.
 
-CANDIDATE PROFILE (the ONLY person you are filtering for):
-- Role family: backend software engineer.
-- Seniority: Intern / Trainee / Junior (or entry-level unspecified).
-- Required language: Go / Golang must be in the tech stack.
-- Location: fully remote, OR on-site / hybrid in Astana, Kazakhstan.
+Посты приходят на русском, казахском или английском — обрабатывай их одинаково.
 
-DECISION ALGORITHM. Apply in this order. The FIRST trigger wins.
+АЛГОРИТМ:
 
-STEP 1 — HARD REJECTIONS. If ANY of these is true, return MATCH: no immediately.
-Do not apply the inclusion rules below; do not "lean toward match" here.
+1. Определи, вакансия ли это вообще. Новости, статьи, мемы, опросы, анонсы
+   мероприятий, рефералки без описания роли — это не вакансия, score = 0.
 
-  R-A) The role is NOT software engineering / programming. Examples that MUST
-       be rejected even if location and seniority look fine:
-         • Аналитик / business analyst / data analyst without coding tasks
-         • UX-редактор / UX writer / copywriter / редактор / журналист
-         • Designer / UX/UI designer / графический дизайнер
-         • Manager / project manager / product manager / scrum master
-         • HR / recruiter / sourcer
-         • Sales / маркетолог / SMM / контент-менеджер
-         • Accountant / бухгалтер / lawyer / юрист / финансист
-         • Support / customer service / call-centre / оператор
-         • QA manual without coding, тестировщик ручной без автоматизации
-         • Teacher / tutor / преподаватель
-         • Any blue-collar / non-IT job
-       If the role name itself signals non-engineering, reject — even when
-       the post mentions "Figma", "Notion", "SQL" or similar tooling.
+2. Если пост содержит несколько разных вакансий, оценивай ЛУЧШУЮ из них для
+   кандидата и в поле "role" укажи именно её.
 
-  R-B) Go / Golang is NOT mentioned anywhere as a required or primary
-       technology. The post must contain the token "Go" or "Golang"
-       referring to the programming language. If the entire stack is
-       Python / Java / JS / TS / PHP / C# / Ruby / Rust / Kotlin / Swift /
-       Scala / Elixir / 1C / etc. and Go is absent — reject.
+3. Извлеки из поста: название роли, стек, уровень (seniority), город, формат
+   работы. Бери ТОЛЬКО то, что написано в посте — ничего не додумывай.
 
-  R-C) Go is mentioned only as "будет плюсом" / "nice to have" / "as a
-       bonus" while a different language is clearly the primary one — reject.
+4. Поле "remote" заполняй строго одним из значений:
+   - "remote"  — явно указана полностью удалённая работа / удалёнка / remote
+   - "hybrid"  — гибрид, частично офис, N дней в офисе
+   - "onsite"  — работа в офисе, требуется присутствие, релокация обязательна
+   - "unknown" — формат работы в посте не указан
 
-  R-D) The post explicitly demands ONLY Middle / Мидл / Senior / Сеньор /
-       Lead / Team Lead / Head / Principal / Staff as the seniority, OR
-       requires "3+ years of commercial experience" / "от 3 лет опыта" or
-       more — reject.
+5. Поставь score от 0 до 100 — насколько вакансия подходит кандидату:
+   - 80-100: стек и уровень совпадают, формат работы подходит
+   - 60-79 : подходит с оговорками (часть стека другая, или уровень на грани)
+   - 40-59 : частичное совпадение, значимые пробелы
+   - 0-39  : не подходит
 
-  R-E) The post is on-site or hybrid in a city OTHER than Astana
-       (e.g. only Алматы / Almaty, Шымкент, Москва, СПб, Bishkek, Ташкент)
-       AND is NOT remote — reject. "Алматы и Астана" / "Astana, Almaty" is
-       a CHOICE that includes Astana — that is fine, do not reject under R-E.
+   Снижай score за: чужой основной язык программирования, требование опыта выше
+   профиля, не-инженерную роль. Ставь 0, если это не вакансия.
 
-  R-F) Not a vacancy: news, memes, questions, articles, opinion pieces,
-       event announcements, referral requests without a described role,
-       generic "we are hiring!" teasers with no role or stack — reject.
+6. Заполни "pros" и "cons" КОНКРЕТИКОЙ из поста: не "хороший стек", а
+   "FastAPI + PostgreSQL". В "cons" пиши пробелы даже у сильных совпадений —
+   кандидат читает их перед откликом.
 
-STEP 2 — MULTI-ROLE POSTS. If the post lists several distinct roles
-(e.g. "ищем Go-разработчика, PHP-разработчика и дизайнера"), evaluate each
-role separately. Match if at least ONE of the listed roles passes STEP 1
-hard-rejections AND would pass STEP 3 below. The candidate applies to
-that specific role.
+ВАЖНО:
+- Оценивай только то, что написано в посте. Не додумывай опыт и условия.
+- Все текстовые поля ("role", "seniority", "location", "summary", "pros",
+  "cons") заполняй ТОЛЬКО на русском языке.
+- Поле "remote" — одно из четырёх английских значений выше.`
 
-STEP 3 — INCLUSION CHECK. Only reached when STEP 1 found no hard rejection.
-ALL THREE must hold for MATCH: yes.
+// jsonContract is appended for models that cannot be given a response schema
+// server-side (Gemma). Gemini-family models get the same shape enforced via
+// ResponseSchema instead.
+const jsonContract = `ФОРМАТ ОТВЕТА:
+Верни ТОЛЬКО JSON-объект, без markdown, без пояснений вне JSON:
+{"score": 0, "role": "", "stack": [], "seniority": "", "remote": "unknown",
+ "location": "", "summary": "", "pros": [], "cons": []}`
 
-  I-1) SENIORITY: post mentions intern / стажёр / стажировка / trainee /
-       junior / джуниор / младший / "без опыта" / "no experience required" /
-       "students welcome" / "entry-level", OR lists multiple seniorities
-       including Junior (e.g. "Junior/Middle", "Middle and below"), OR
-       seniority is simply not specified anywhere in the post.
-
-  I-2) TECHNOLOGY: Go / Golang appears as a required or primary backend
-       technology (passed R-B and R-C above).
-
-  I-3) LOCATION: any of the following holds:
-         • fully remote / удалённая / удалёнка / remote / worldwide
-         • cities listed INCLUDE Astana (treat "и/или/,/" as CHOICE)
-         • generic "Kazakhstan" / "Казахстан" with no specific city
-         • hybrid or on-site in Astana
-         • location is not mentioned at all (benefit of the doubt)
-
-When in doubt between MATCH: yes and MATCH: no on a borderline post that
-already passed STEP 1, prefer MATCH: yes — the human reviewer filters
-borderline cases. But never override a STEP 1 hard rejection.`
-
-// geminiOutput is appended to decisionRules for Gemini-family models, which
-// also have ResponseSchema enforced in code — the prose here is mostly to
-// shape the "reason" string.
-const geminiOutput = `OUTPUT:
-Return ONLY a JSON object with keys "match" (true/false) and "reason"
-(short Russian sentence, <= 140 chars).
-  - For match=true: which role/city/level qualified the post.
-  - For match=false: cite the specific rule that failed (e.g. "Правило 2:
-    основной язык Python, Go не упомянут").`
-
-// gemmaOutput drives the Gemma path. Gemma 4 has a habit of literally echoing
-// shape templates verbatim on short / ambiguous posts (both JSON and any
-// "<placeholder>" form). The output spec here therefore uses concrete
-// examples ONLY — no placeholder strings, no angle brackets, nothing the
-// model could confuse for a literal value to return. parseGemmaText reads
-// the two-line response back, and also rejects any reason that still looks
-// like a template (just in case).
-const gemmaOutput = `OUTPUT:
-Reply with EXACTLY two lines. No JSON. No Markdown. No prose before or after.
-Line 1 starts with "MATCH:" then the literal word "yes" or "no".
-Line 2 starts with "REASON:" then a short Russian sentence (max 140 chars)
-that NAMES THE ACTUAL REASON — never repeat or paraphrase this instruction.
-
-Example for a post that fits the candidate:
-MATCH: yes
-REASON: Junior Go разработчик, удалёнка, упомянут Astana
-
-Example for a post that does NOT fit:
-MATCH: no
-REASON: Правило 2: основной язык Python, Go не упомянут`
-
-// systemPrompt is the full prompt for Gemini-family models (used as
-// SystemInstruction). gemmaPrompt is its Gemma-friendly twin, inlined into
-// each user message because Gemma rejects SystemInstruction.
-const (
-	systemPrompt = decisionRules + "\n\n" + geminiOutput
-	gemmaPrompt  = decisionRules + "\n\n" + gemmaOutput
-)
-
-// Verdict is the structured response from the model.
+// Verdict is the model's assessment of a single post.
 type Verdict struct {
-	Match  bool   `json:"match"`
-	Reason string `json:"reason"`
+	Score     int      `json:"score"`
+	Role      string   `json:"role"`
+	Stack     []string `json:"stack"`
+	Seniority string   `json:"seniority"`
+	Remote    string   `json:"remote"`
+	Location  string   `json:"location"`
+	Summary   string   `json:"summary"`
+	Pros      []string `json:"pros"`
+	Cons      []string `json:"cons"`
 }
 
-// Analyzer is a thin wrapper around a configured Gemini generative model.
+// Matches reports whether a post should be forwarded. The remote-only rule is
+// enforced here rather than left to the prompt: it is the candidate's one hard
+// constraint, and a borderline post must not be able to talk the model out of it.
+func (v Verdict) Matches(threshold int) bool {
+	if v.Remote == RemoteOnsite || v.Remote == RemoteHybrid {
+		return false
+	}
+	return v.Score >= threshold
+}
+
+// Analyzer scores posts against a candidate profile, with a rate limiter and
+// an optional fallback model for when the primary model's quota runs out.
 type Analyzer struct {
-	client  *genai.Client
-	model   *genai.GenerativeModel
+	client *genai.Client
+
+	primary      *genai.GenerativeModel
+	primaryName  string
+	fallback     *genai.GenerativeModel
+	fallbackName string
+
 	limiter *rate.Limiter
-	// isGemma is true when the configured model is a Gemma variant served via
-	// the Gemini API. Gemma does not support SystemInstruction /
-	// ResponseMIMEType / ResponseSchema, so the analyser inlines the prompt
-	// and reads back a two-line "MATCH: / REASON:" text format instead of
-	// structured JSON. See gemmaPrompt + parseGemmaText.
-	isGemma bool
-	// onRetry is invoked before each 429 retry so the caller can observe
-	// quota pressure. Nil by default.
-	onRetry func(attempt int, wait time.Duration, err error)
+	prompt  string
+
+	// mu guards usingFallback, which flips once per process and is read on
+	// every Analyze call — the backfill path may run concurrently with live
+	// updates.
+	mu            sync.Mutex
+	usingFallback bool
+
+	onRetry    func(attempt int, wait time.Duration, err error)
+	onFallback func(from, to string)
 }
 
-// New constructs an Analyzer. The returned value must be closed with Close().
-// rpm is the target request-per-minute ceiling — the free Gemini tier is
-// currently 15. Pass 0 to disable the built-in limiter.
-func New(ctx context.Context, apiKey, modelName string, rpm int) (*Analyzer, error) {
+// New constructs an Analyzer. profile is the candidate description injected
+// into the prompt. fallbackModel may be empty to disable quota failover.
+// rpm is the request-per-minute ceiling; 0 disables the limiter.
+func New(ctx context.Context, apiKey, modelName, fallbackModel, profile string, rpm int) (*Analyzer, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, errors.New("gemini: api key is empty")
+	}
+	if strings.TrimSpace(profile) == "" {
+		return nil, errors.New("gemini: candidate profile is empty")
 	}
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return nil, fmt.Errorf("gemini: new client: %w", err)
 	}
 
-	isGemma := strings.HasPrefix(strings.ToLower(modelName), "gemma")
-
-	model := client.GenerativeModel(modelName)
-
-	// Gemma models rejected SystemInstruction / ResponseMIMEType /
-	// ResponseSchema at the API level — they are Gemini-only features. For
-	// Gemma we fall back to inlining the system prompt into each user turn
-	// and extracting JSON from free-form text. See Analyze + extractJSONObject.
-	if !isGemma {
-		model.SystemInstruction = &genai.Content{
-			Parts: []genai.Part{genai.Text(systemPrompt)},
-		}
-		model.ResponseMIMEType = "application/json"
-		model.ResponseSchema = &genai.Schema{
-			Type: genai.TypeObject,
-			Properties: map[string]*genai.Schema{
-				"match":  {Type: genai.TypeBoolean},
-				"reason": {Type: genai.TypeString},
-			},
-			Required: []string{"match", "reason"},
-		}
+	a := &Analyzer{
+		client:      client,
+		primaryName: modelName,
+		prompt:      instructions + "\n\n=== ПРОФИЛЬ КАНДИДАТА ===\n" + strings.TrimSpace(profile),
+	}
+	a.primary = a.newModel(modelName)
+	if fallbackModel != "" && fallbackModel != modelName {
+		a.fallbackName = fallbackModel
+		a.fallback = a.newModel(fallbackModel)
 	}
 
-	// Low temperature → stable, deterministic verdicts for near-identical posts.
-	temp := float32(0.1)
-	model.Temperature = &temp
-
-	// Harm blocking off — job posts occasionally include salary/demographic
-	// phrases that upstream filters misclassify. We are not exposing this
-	// output publicly, we're sending it to the user's own chat.
-	model.SafetySettings = []*genai.SafetySetting{
-		{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockNone},
-		{Category: genai.HarmCategoryHateSpeech, Threshold: genai.HarmBlockNone},
-		{Category: genai.HarmCategorySexuallyExplicit, Threshold: genai.HarmBlockNone},
-		{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockNone},
-	}
-
-	a := &Analyzer{client: client, model: model, isGemma: isGemma}
 	if rpm > 0 {
 		// Steady-state 1 request every (60/rpm) seconds. Burst=1 keeps us
 		// well under the quota even under retry storms.
 		a.limiter = rate.NewLimiter(rate.Every(time.Minute/time.Duration(rpm)), 1)
 	}
 	return a, nil
+}
+
+// newModel configures one model handle. Gemma rejects SystemInstruction and
+// ResponseSchema at the API layer, so for that family the prompt is inlined
+// into the user turn and the JSON contract is stated in prose instead.
+func (a *Analyzer) newModel(name string) *genai.GenerativeModel {
+	m := a.client.GenerativeModel(name)
+
+	if !isGemma(name) {
+		m.SystemInstruction = &genai.Content{
+			Parts: []genai.Part{genai.Text(a.prompt)},
+		}
+		m.ResponseMIMEType = "application/json"
+		m.ResponseSchema = verdictSchema()
+	}
+
+	// Low temperature -> stable, comparable scores for near-identical posts.
+	temp := float32(0.1)
+	m.Temperature = &temp
+
+	// Harm blocking off — job posts occasionally include salary/demographic
+	// phrases that upstream filters misclassify. Output goes to the user's
+	// own chat, not anywhere public.
+	m.SafetySettings = []*genai.SafetySetting{
+		{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockNone},
+		{Category: genai.HarmCategoryHateSpeech, Threshold: genai.HarmBlockNone},
+		{Category: genai.HarmCategorySexuallyExplicit, Threshold: genai.HarmBlockNone},
+		{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockNone},
+	}
+	return m
+}
+
+func verdictSchema() *genai.Schema {
+	strs := &genai.Schema{Type: genai.TypeArray, Items: &genai.Schema{Type: genai.TypeString}}
+	return &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"score":     {Type: genai.TypeInteger, Description: "0-100"},
+			"role":      {Type: genai.TypeString},
+			"stack":     strs,
+			"seniority": {Type: genai.TypeString},
+			"remote": {
+				Type: genai.TypeString,
+				Enum: []string{RemoteYes, RemoteHybrid, RemoteOnsite, RemoteUnknown},
+			},
+			"location": {Type: genai.TypeString},
+			"summary":  {Type: genai.TypeString},
+			"pros":     strs,
+			"cons":     strs,
+		},
+		Required: []string{"score", "remote", "summary"},
+	}
 }
 
 // Close releases gRPC resources held by the underlying client.
@@ -243,31 +228,34 @@ func (a *Analyzer) Close() error {
 	return a.client.Close()
 }
 
-// SetRetryHook registers a callback fired before each 429 sleep. Used by the
-// caller to log quota pressure without leaking slog into this package.
+// SetRetryHook registers a callback fired before each 429 sleep.
 func (a *Analyzer) SetRetryHook(fn func(attempt int, wait time.Duration, err error)) {
 	a.onRetry = fn
 }
 
-// Analyze sends one post to Gemini and returns its classification. It blocks
-// on the configured rate limiter and transparently retries up to
-// maxRetries429 on RESOURCE_EXHAUSTED, honouring the server-supplied
-// "retry in Xs" hint. Cancel ctx to abort both the limiter and the retry sleep.
+// SetFallbackHook registers a callback fired once, when the analyser gives up
+// on the primary model and switches to the fallback for the rest of the run.
+func (a *Analyzer) SetFallbackHook(fn func(from, to string)) {
+	a.onFallback = fn
+}
+
+// Model returns the model currently in use.
+func (a *Analyzer) Model() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.usingFallback {
+		return a.fallbackName
+	}
+	return a.primaryName
+}
+
+// Analyze scores one post. It blocks on the rate limiter, retries up to
+// maxRetries429 on RESOURCE_EXHAUSTED honouring the server's "retry in Xs"
+// hint, and switches to the fallback model when the primary's quota is spent.
 func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error) {
 	postText = strings.TrimSpace(postText)
 	if postText == "" {
 		return Verdict{}, errors.New("gemini: empty post")
-	}
-
-	input := postText
-	if a.isGemma {
-		// Gemma ignores SystemInstruction / ResponseSchema, so everything has
-		// to live in the user message. The output spec asks for two text
-		// lines (MATCH: yes|no / REASON: ...) — see gemmaOutput for why JSON
-		// is not used here.
-		input = gemmaPrompt +
-			"\n\n---\nPOST:\n" + postText +
-			"\n---\n\nReply with the two lines now. No JSON. No code fences."
 	}
 
 	var resp *genai.GenerateContentResponse
@@ -278,13 +266,24 @@ func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error
 			}
 		}
 
+		model, name := a.current()
+
 		var err error
-		resp, err = a.model.GenerateContent(ctx, genai.Text(input))
+		resp, err = model.GenerateContent(ctx, genai.Text(a.buildInput(name, postText)))
 		if err == nil {
 			break
 		}
-		if !isQuotaExceeded(err) || attempt >= maxRetries429 {
+		if !isQuotaExceeded(err) {
 			return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
+		}
+		if attempt >= maxRetries429 {
+			// Primary model is out of quota for today. One switch per process;
+			// after that the error is real.
+			if !a.switchToFallback() {
+				return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
+			}
+			attempt = -1 // restart the retry budget on the fallback model
+			continue
 		}
 
 		wait := parseRetryAfter(err)
@@ -305,14 +304,6 @@ func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error
 		}
 	}
 
-	if a.isGemma {
-		text, err := extractResponseText(resp)
-		if err != nil {
-			return Verdict{}, err
-		}
-		return parseGemmaText(text)
-	}
-
 	raw, err := extractJSONObject(resp)
 	if err != nil {
 		return Verdict{}, err
@@ -322,7 +313,70 @@ func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return Verdict{}, fmt.Errorf("gemini: decode %q: %w", truncate(raw, 200), err)
 	}
-	return v, nil
+	return Normalize(v), nil
+}
+
+// Normalize clamps the score into range and maps free-form remote values onto
+// the four known constants. Exported so tests can exercise it directly.
+func Normalize(v Verdict) Verdict {
+	if v.Score < 0 {
+		v.Score = 0
+	}
+	if v.Score > 100 {
+		v.Score = 100
+	}
+	switch strings.ToLower(strings.TrimSpace(v.Remote)) {
+	case RemoteYes, "удалённо", "удаленно", "удалёнка", "удаленка":
+		v.Remote = RemoteYes
+	case RemoteHybrid, "гибрид":
+		v.Remote = RemoteHybrid
+	case RemoteOnsite, "on-site", "office", "офис":
+		v.Remote = RemoteOnsite
+	default:
+		v.Remote = RemoteUnknown
+	}
+	return v
+}
+
+// buildInput assembles the user turn. Gemini-family models already carry the
+// prompt as a system instruction, so they only receive the post.
+func (a *Analyzer) buildInput(modelName, postText string) string {
+	if !isGemma(modelName) {
+		return "ПОСТ:\n" + postText
+	}
+	return a.prompt + "\n\n" + jsonContract + "\n\n---\nПОСТ:\n" + postText +
+		"\n---\n\nВерни только JSON."
+}
+
+func (a *Analyzer) current() (*genai.GenerativeModel, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.usingFallback {
+		return a.fallback, a.fallbackName
+	}
+	return a.primary, a.primaryName
+}
+
+// switchToFallback flips to the fallback model. Returns false when there is no
+// fallback configured or the switch already happened.
+func (a *Analyzer) switchToFallback() bool {
+	a.mu.Lock()
+	if a.fallback == nil || a.usingFallback {
+		a.mu.Unlock()
+		return false
+	}
+	a.usingFallback = true
+	from, to := a.primaryName, a.fallbackName
+	a.mu.Unlock()
+
+	if a.onFallback != nil {
+		a.onFallback(from, to)
+	}
+	return true
+}
+
+func isGemma(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "gemma")
 }
 
 // isQuotaExceeded reports whether err is a 429 from the Gemini API. Works with
@@ -361,7 +415,6 @@ func parseRetryAfter(err error) time.Duration {
 }
 
 // extractResponseText concatenates every text Part of the first candidate.
-// Both response paths (Gemini JSON, Gemma plain text) start here.
 func extractResponseText(resp *genai.GenerateContentResponse) (string, error) {
 	if resp == nil || len(resp.Candidates) == 0 {
 		return "", errors.New("gemini: empty response")
@@ -383,54 +436,21 @@ func extractResponseText(resp *genai.GenerateContentResponse) (string, error) {
 	return text, nil
 }
 
-// gemmaMatchRe matches "MATCH: yes/no" (case- and whitespace-insensitive).
-// Accepts Russian "да/нет" and "true/false" as defensive aliases — Gemma
-// occasionally substitutes those for the requested literals.
-var (
-	gemmaMatchRe  = regexp.MustCompile(`(?im)^[\s>*\-]*MATCH\s*[:=]\s*"?(yes|no|true|false|да|нет)"?`)
-	gemmaReasonRe = regexp.MustCompile(`(?im)^[\s>*\-]*REASON\s*[:=]\s*(.+?)\s*$`)
-
-	// gemmaPlaceholderRe rejects reasons that are clearly the prompt template
-	// echoed back. Covers angle-bracket placeholders ("<short Russian ...>"),
-	// the literal phrasings used in our prompt, and Gemma's own habit of
-	// returning the word "string"/"reason" as a value.
-	gemmaPlaceholderRe = regexp.MustCompile(`(?i)<[^>]*>|short russian sentence|max 140 chars|^(?:string|reason|placeholder|tbd|n\/a)\.?$`)
-)
-
-// parseGemmaText turns the two-line "MATCH: ... / REASON: ..." reply into a
-// Verdict. Surrounding markdown bullets, blockquotes or code fences are
-// tolerated. A reason that looks like the prompt template (placeholder
-// echo) is treated as a parse failure so the post is skipped instead of
-// forwarded with a useless caption.
-func parseGemmaText(text string) (Verdict, error) {
-	m := gemmaMatchRe.FindStringSubmatch(text)
-	if len(m) < 2 {
-		return Verdict{}, fmt.Errorf("gemini: no MATCH line in response: %q", truncate(text, 200))
-	}
-	v := Verdict{}
-	switch strings.ToLower(m[1]) {
-	case "yes", "true", "да":
-		v.Match = true
-	}
-	if r := gemmaReasonRe.FindStringSubmatch(text); len(r) >= 2 {
-		v.Reason = strings.Trim(strings.TrimSpace(r[1]), "\"'`")
-	}
-	if v.Match && gemmaPlaceholderRe.MatchString(v.Reason) {
-		return Verdict{}, fmt.Errorf("gemini: reason looks like prompt template (echo): %q", truncate(v.Reason, 200))
-	}
-	return v, nil
-}
-
 // extractJSONObject pulls the first balanced {...} span out of the model's
-// response. Used only for the Gemini path (ResponseSchema-enforced JSON).
-// Walking the string with a brace counter (respecting string literals) is
-// resilient to ```json fences or stray prose around the object.
+// response. Walking the string with a brace counter (respecting string
+// literals) is resilient to ```json fences or stray prose around the object,
+// which Gemma still emits occasionally.
 func extractJSONObject(resp *genai.GenerateContentResponse) (string, error) {
 	text, err := extractResponseText(resp)
 	if err != nil {
 		return "", err
 	}
+	return ExtractJSONObject(text)
+}
 
+// ExtractJSONObject is the string-level half of extractJSONObject, split out
+// so it can be tested without constructing SDK response types.
+func ExtractJSONObject(text string) (string, error) {
 	start := strings.Index(text, "{")
 	if start < 0 {
 		return "", fmt.Errorf("gemini: no JSON object in response: %q", truncate(text, 200))

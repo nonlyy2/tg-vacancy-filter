@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -108,4 +109,74 @@ func extractMessages(resp tg.MessagesMessagesClass) ([]tg.MessageClass, error) {
 	default:
 		return nil, fmt.Errorf("unexpected getHistory response: %T", resp)
 	}
+}
+
+// FetchHistoryAfter returns every channel post newer than minID, oldest-first.
+// Used on subsequent polls, where the cursor from the previous run is cheaper
+// and more precise than a date cutoff.
+func FetchHistoryAfter(
+	ctx context.Context,
+	api *tg.Client,
+	peer tg.InputPeerClass,
+	minID int,
+) ([]*tg.Message, error) {
+	var (
+		collected []*tg.Message
+		offsetID  int
+	)
+	const batch = 100
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:     peer,
+			OffsetID: offsetID,
+			MinID:    minID,
+			Limit:    batch,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("getHistory: %w", err)
+		}
+
+		msgs, err := extractMessages(resp)
+		if err != nil {
+			return nil, err
+		}
+		if len(msgs) == 0 {
+			break
+		}
+
+		var oldestID int
+		for _, raw := range msgs {
+			if id := raw.GetID(); id != 0 && (oldestID == 0 || id < oldestID) {
+				oldestID = id
+			}
+			m, ok := raw.(*tg.Message)
+			if !ok {
+				// Service messages (pins, title changes) still advance
+				// pagination but carry nothing to classify.
+				continue
+			}
+			if m.ID <= minID {
+				continue
+			}
+			collected = append(collected, m)
+		}
+
+		if oldestID == 0 || oldestID <= minID+1 || oldestID == offsetID {
+			break
+		}
+		offsetID = oldestID
+	}
+
+	sortByIDAsc(collected)
+	return collected, nil
+}
+
+// sortByIDAsc puts messages in chronological order. getHistory returns
+// newest-first, and the pipeline must advance its cursor monotonically.
+func sortByIDAsc(msgs []*tg.Message) {
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].ID < msgs[j].ID })
 }

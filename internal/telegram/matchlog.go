@@ -16,9 +16,12 @@ type MatchRecord struct {
 	ChannelID    int64     `json:"channel_id"`
 	ChannelTitle string    `json:"channel"`
 	MessageID    int       `json:"msg_id"`
-	Reason       string    `json:"reason"`
+	Score        int       `json:"score"`
+	Role         string    `json:"role,omitempty"`
+	Remote       string    `json:"remote,omitempty"`
+	Summary      string    `json:"summary,omitempty"`
 	Link         string    `json:"link"`
-	Source       string    `json:"source"` // "live" or "backfill"
+	Source       string    `json:"source"` // "live" or "poll"
 }
 
 // MatchLog appends JSON-lines to a file on disk. A nil *MatchLog is a safe
