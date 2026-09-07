@@ -286,7 +286,8 @@ gh secret set DESTINATION
 
 # optional, non-secret knobs
 gh variable set GEMINI_MODEL --body "gemini-3.5-flash-lite"
-gh variable set MATCH_THRESHOLD --body "65"
+gh variable set GEMINI_MODEL_FALLBACK --body "gemma-4-26b-a4b-it"
+gh variable set MATCH_THRESHOLD --body "60"
 
 gh workflow run poll.yml     # first run, then watch it
 gh run watch
