@@ -117,7 +117,7 @@ go build -o bot .
 ```
 === gemini ===
   ✓ api key valid — 47 models support generateContent
-  ✓ primary  gemini-2.5-flash-lite
+  ✓ primary  gemini-3.5-flash-lite
   ✓ fallback gemma-4-26b-a4b-it
 === telegram ===
   session from   TG_STRING_SESSION
@@ -136,11 +136,47 @@ account can write to the destination.
 
 ## Modes
 
-| Command         | Behaviour                                                        |
-| --------------- | ---------------------------------------------------------------- |
-| `./bot -once`   | Poll every channel once, then exit. Used by the scheduled deploy. |
-| `./bot`         | Stay connected and react to live updates. For an always-on host.  |
-| `./bot -doctor` | Preflight checks, then exit.                                      |
+| Command                  | Behaviour                                                        |
+| ------------------------ | ---------------------------------------------------------------- |
+| `./bot -once`            | Poll every channel once, then exit. Used by the scheduled deploy. |
+| `./bot -once -dry-run`   | Same, but sends nothing — scores and logs only. Calibration mode. |
+| `./bot`                  | Stay connected and react to live updates. For an always-on host.  |
+| `./bot -doctor`          | Preflight checks, then exit.                                      |
+| `./bot -folders=all`     | List chat folders and the channel ids in each.                    |
+
+### Filling SOURCE_CHANNEL_IDS from a chat folder
+
+Curating the watch list in the Telegram app is much easier than collecting ids
+by hand. Put the channels into a folder, then:
+
+```bash
+./bot -folders=vacancies
+```
+
+```
+=== folder "vacancies" — 28 channels ===
+  -1001096154976    Dev KZ | Vacancy                    @devkz_jobs
+  -1001344577123    Backend Job Offers                  @runello_rus_backend
+  ...
+
+SOURCE_CHANNEL_IDS=-1001096154976,-1001344577123,...
+```
+
+Paste the last line into `.env`.
+
+### Calibrating the profile
+
+`-dry-run` classifies real traffic and writes the verdict next to the post text
+at `LOG_LEVEL=debug`, without notifying anyone:
+
+```bash
+POLL_STATE_PATH=/tmp/cal.json MATCH_LOG_PATH= LOG_LEVEL=debug \
+  ./bot -once -dry-run
+```
+
+Read the scores. A vacancy that should have matched but did not is a line to
+add to `profile/candidate.md`; a rejection you disagree with usually means a
+stop-condition is firing too eagerly.
 
 ### The first poll sweeps history
 
@@ -171,8 +207,8 @@ Full list with comments in [`.env.example`](./.env.example). The ones that matte
 | `DESTINATION`           |    ✅    |                          | `me`, a username, a numeric channel id, or a `t.me/+…` link.   |
 | `GEMINI_API_KEY`        |    ✅    |                          | From Google AI Studio.                                        |
 | `PROFILE_PATH`          |          | `profile/candidate.md`   | The candidate description injected into the prompt.           |
-| `MATCH_THRESHOLD`       |          | `65`                     | Minimum score to forward.                                     |
-| `GEMINI_MODEL`          |          | `gemini-2.5-flash-lite`  | Verify with `-doctor`; the free lineup changes.               |
+| `MATCH_THRESHOLD`       |          | `60`                     | Minimum score to forward.                                     |
+| `GEMINI_MODEL`          |          | `gemini-3.5-flash-lite`  | Verify with `-doctor`; the free lineup changes.               |
 | `GEMINI_MODEL_FALLBACK` |          | `gemma-4-26b-a4b-it`     | Takes over when the primary's daily quota runs out.           |
 | `GEMINI_RPM`            |          | `12`                     | Client-side ceiling. `0` disables.                            |
 | `POLL_STATE_PATH`       |          | `state.json`             | Cursor + fingerprints. Must persist between runs.             |
@@ -191,6 +227,14 @@ The rule of thumb: a **Gemini-family** model as `GEMINI_MODEL` (the response
 schema is enforced server-side, so verdicts are always parseable), and a
 **Gemma** model as `GEMINI_MODEL_FALLBACK` (much higher requests-per-day, which
 is what lets a long backlog finish after the primary model's cap is hit).
+
+**Free-tier caps are per model and vary wildly.** `gemini-2.5-flash-lite`
+allows 20 requests *per day*; a newer sibling such as `gemini-3.5-flash-lite`
+has its own, far larger allowance. If a run stalls in backoff immediately,
+that model is spent — switch to another from the `-doctor` list rather than
+lowering `GEMINI_RPM`. A 429 whose retry hint exceeds 30s is treated as a
+quota wall and trips the fallback at once instead of sleeping through three
+retries.
 
 ---
 
@@ -241,7 +285,7 @@ gh secret set SOURCE_CHANNEL_IDS
 gh secret set DESTINATION
 
 # optional, non-secret knobs
-gh variable set GEMINI_MODEL --body "gemini-2.5-flash-lite"
+gh variable set GEMINI_MODEL --body "gemini-3.5-flash-lite"
 gh variable set MATCH_THRESHOLD --body "65"
 
 gh workflow run poll.yml     # first run, then watch it

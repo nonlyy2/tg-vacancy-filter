@@ -23,6 +23,12 @@ import (
 // RESOURCE_EXHAUSTED before giving up (or switching to the fallback model).
 const maxRetries429 = 3
 
+// quotaWallHint is the retry delay above which a 429 is treated as a spent
+// quota rather than a burst. Free-tier daily caps come back with hints of a
+// minute or more and never clear within a run, so sleeping through three of
+// them wastes minutes of a scheduled job — switch to the fallback at once.
+const quotaWallHint = 30 * time.Second
+
 // Remote formats the model is asked to classify a post into.
 const (
 	RemoteYes     = "remote"
@@ -49,6 +55,12 @@ Telegram-канала подходит одному конкретному ка�
 1. Определи, вакансия ли это вообще. Новости, статьи, мемы, опросы, анонсы
    мероприятий, рефералки без описания роли — это не вакансия, score = 0.
 
+   Отдельно: резюме соискателя — это НЕ вакансия, score = 0. Признак: автор
+   описывает СВОЙ опыт и ищет работу ("ищу работу", "рассмотрю предложения",
+   "мой стек", "опыт 3 года", ссылка на своё резюме), а не описывает позицию
+   в компании. Такие посты приходят из каналов с резюме и легко путаются с
+   вакансиями, потому что содержат тот же словарь.
+
 2. Если пост содержит несколько разных вакансий, оценивай ЛУЧШУЮ из них для
    кандидата и в поле "role" укажи именно её.
 
@@ -61,16 +73,51 @@ Telegram-канала подходит одному конкретному ка�
    - "onsite"  — работа в офисе, требуется присутствие, релокация обязательна
    - "unknown" — формат работы в посте не указан
 
-5. Поставь score от 0 до 100 — насколько вакансия подходит кандидату:
-   - 80-100: стек и уровень совпадают, формат работы подходит
-   - 60-79 : подходит с оговорками (часть стека другая, или уровень на грани)
+5. СТОП-УСЛОВИЯ. Проверь их ДО того, как ставить score. Если сработало хотя бы
+   одно — score НЕ МОЖЕТ быть выше указанного потолка, независимо от того,
+   насколько хорошо совпало всё остальное:
+
+   - это не вакансия                                        -> score = 0
+   - роль не инженерная (см. профиль)                       -> score <= 10
+   - формат работы ОФИС или ГИБРИД                          -> score <= 15
+   - требуемый уровень СТРОГО выше профиля кандидата
+     (Senior / Lead / Head / Principal / Staff)             -> score <= 15
+   - требуемый опыт больше, чем есть у кандидата
+     (например "от 3 лет", "5+ years")                      -> score <= 15
+   - основной язык вакансии не из стека кандидата, а его
+     язык упомянут лишь как "будет плюсом"                  -> score <= 25
+
+   Потолок применяется даже если стек, город и всё прочее идеально совпали.
+   Требование "от 3 лет опыта" в вакансии на Go — это стоп-условие, а не
+   мелкий недостаток.
+
+   ЧТО НЕ ЯВЛЯЕТСЯ СТОП-УСЛОВИЕМ:
+   - грейд Middle сам по себе. Middle входит в диапазон кандидата. Потолок 15
+     применяй к Middle-вакансии ТОЛЬКО если в ней отдельно требуют 3+ лет
+     опыта. Если требований по годам нет — оценивай по стеку и формату,
+     нормальный результат для подходящей Middle-вакансии 60-80.
+   - remote = "unknown" (формат работы в посте не указан). Это НЕ отказ.
+     Оцени вакансию по стеку и уровню как обычно, а в "cons" напиши, что
+     формат работы не указан и его надо уточнить. Многие подходящие
+     удалённые вакансии просто не пишут слово "удалённо".
+   - отсутствие вилки зарплаты, названия компании или списка бенефитов.
+
+6. Если ни одно стоп-условие не сработало, поставь score от 0 до 100:
+   - 80-100: стек и уровень совпадают, удалённый формат подтверждён
+   - 60-79 : подходит, есть небольшие пробелы — кандидату стоит откликнуться
    - 40-59 : частичное совпадение, значимые пробелы
-   - 0-39  : не подходит
+   - 5-39  : не подходит
 
-   Снижай score за: чужой основной язык программирования, требование опыта выше
-   профиля, не-инженерную роль. Ставь 0, если это не вакансия.
+   Порог отклика — 60. Не ставь 60 и выше, если сам не считаешь, что кандидату
+   стоит потратить время на этот отклик.
 
-6. Заполни "pros" и "cons" КОНКРЕТИКОЙ из поста: не "хороший стек", а
+   score = 0 означает РОВНО ОДНО: это не вакансия. Настоящая вакансия, которая
+   кандидату не подходит, получает 5-39, а не 0. Не используй 0 как общий отказ.
+
+   Оплачиваемая стажировка или trainee-позиция по стеку кандидата — это
+   реальная вакансия низкого приоритета: 40-60, а не 0.
+
+7. Заполни "pros" и "cons" КОНКРЕТИКОЙ из поста: не "хороший стек", а
    "FastAPI + PostgreSQL". В "cons" пиши пробелы даже у сильных совпадений —
    кандидат читает их перед откликом.
 
@@ -276,21 +323,25 @@ func (a *Analyzer) Analyze(ctx context.Context, postText string) (Verdict, error
 		if !isQuotaExceeded(err) {
 			return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
 		}
-		if attempt >= maxRetries429 {
-			// Primary model is out of quota for today. One switch per process;
-			// after that the error is real.
-			if !a.switchToFallback() {
-				return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
-			}
-			attempt = -1 // restart the retry budget on the fallback model
-			continue
-		}
-
 		wait := parseRetryAfter(err)
 		if wait <= 0 {
-			// Fallback: exponential backoff starting at 10s.
+			// No hint: exponential backoff starting at 10s.
 			wait = time.Duration(1<<attempt) * 10 * time.Second
 		}
+
+		// Either the retry budget is spent, or the server is telling us this
+		// is a wall rather than a burst. Both mean: stop waiting on this model.
+		if attempt >= maxRetries429 || wait >= quotaWallHint {
+			if !a.switchToFallback() {
+				if attempt >= maxRetries429 {
+					return Verdict{}, fmt.Errorf("gemini: generate: %w", err)
+				}
+			} else {
+				attempt = -1 // restart the retry budget on the fallback model
+				continue
+			}
+		}
+
 		// Add a small safety margin — Google's retry-after is the minimum.
 		wait += time.Second
 

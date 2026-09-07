@@ -23,12 +23,12 @@ const (
 	// what keeps verdict parsing deterministic. Gemma is kept as the fallback
 	// because its free-tier RPD (~14400) is an order of magnitude higher, so
 	// it can absorb a bootstrap sweep after the primary model's daily cap.
-	defaultModel         = "gemini-2.5-flash-lite"
+	defaultModel         = "gemini-3.5-flash-lite"
 	defaultModelFallback = "gemma-4-26b-a4b-it"
 	defaultGeminiRPM     = 12
 
 	defaultProfilePath    = "profile/candidate.md"
-	defaultMatchThreshold = 65
+	defaultMatchThreshold = 60
 	defaultPollStatePath  = "state.json"
 	defaultPollMaxRuntime = 20 * time.Minute
 

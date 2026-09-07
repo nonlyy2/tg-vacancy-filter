@@ -73,7 +73,7 @@ func Run(ctx context.Context, log *slog.Logger) error {
 
 // RunOnce polls every source channel once and exits. This is the mode the
 // scheduled workflow runs: no long-lived process, no open laptop.
-func RunOnce(ctx context.Context, log *slog.Logger) error {
+func RunOnce(ctx context.Context, log *slog.Logger, dryRun bool) error {
 	e, err := setup(ctx, log, nil)
 	if err != nil {
 		return err
@@ -84,6 +84,10 @@ func RunOnce(ctx context.Context, log *slog.Logger) error {
 		s, err := e.connect(ctx)
 		if err != nil {
 			return err
+		}
+		if dryRun {
+			s.proc.SetDryRun(true)
+			log.Warn("dry run: verdicts are logged, nothing is sent")
 		}
 
 		sources, missing, err := tgclient.ResolveChannelPeers(ctx, s.api, e.cfg.SourceChannels)

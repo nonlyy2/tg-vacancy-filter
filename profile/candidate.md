@@ -22,7 +22,8 @@ Backend Developer · Full-Stack Developer · AI/ML Engineer · Software Engineer
 ## Уровень
 
 Подходит: Junior · entry-level · «опыт не требуется» · уровень не указан ·
-Middle с требованием **не более ~2 лет** коммерческого опыта.
+**Middle** — грейд Middle сам по себе подходит; отсекай Middle-вакансию только
+если в ней требуют более ~2 лет коммерческого опыта.
 
 Не подходит: Senior · Lead · Team Lead · Head · Principal · Staff ·
 требование «от 3 лет опыта» и выше.

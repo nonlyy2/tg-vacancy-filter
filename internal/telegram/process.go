@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 
 	"github.com/gotd/td/tg"
 
@@ -38,6 +39,11 @@ type Processor struct {
 	seen      Seen
 	threshold int
 	log       *slog.Logger
+
+	// dryRun classifies and logs but never sends. Used to calibrate the
+	// profile and the threshold against real traffic without filling the
+	// destination chat with test output.
+	dryRun bool
 }
 
 // NewProcessor builds a Processor. matchLog and seen may be nil.
@@ -57,6 +63,12 @@ func NewProcessor(
 		threshold: threshold,
 		log:       log,
 	}
+}
+
+// SetDryRun disables sending. Verdicts are still logged and written to the
+// match log, so a run can be scored without notifying anyone.
+func (p *Processor) SetDryRun(dry bool) {
+	p.dryRun = dry
 }
 
 // Process classifies one post and forwards it when it clears the threshold.
@@ -94,14 +106,26 @@ func (p *Processor) Process(
 		return OutcomeError, nil
 	}
 
-	logger.Debug("verdict",
+	attrs := []any{
 		slog.Int("score", verdict.Score),
 		slog.String("role", verdict.Role),
 		slog.String("remote", verdict.Remote),
 		slog.String("summary", verdict.Summary),
-	)
+	}
+	if p.dryRun {
+		// During calibration the verdict is only useful next to the text it
+		// was made from — that is how a misread format or seniority is spotted.
+		attrs = append(attrs, slog.String("post", excerpt(text, 700)))
+	}
+	logger.Debug("verdict", attrs...)
 
 	if !verdict.Matches(p.threshold) {
+		logger.Debug("below threshold",
+			slog.String("channel", ch.Title),
+			slog.Int("score", verdict.Score),
+			slog.String("role", verdict.Role),
+			slog.String("remote", verdict.Remote),
+		)
 		return OutcomeRejected, nil
 	}
 
@@ -110,6 +134,7 @@ func (p *Processor) Process(
 		slog.Int("score", verdict.Score),
 		slog.String("role", verdict.Role),
 		slog.String("remote", verdict.Remote),
+		slog.String("link", BuildPostLink(ch, msgID)),
 	)
 
 	// Persist before the Telegram send so a send failure cannot silently drop
@@ -128,6 +153,10 @@ func (p *Processor) Process(
 		logger.Warn("matchlog append failed", slog.Any("err", err))
 	}
 
+	if p.dryRun {
+		return OutcomeMatched, nil
+	}
+
 	if err := p.sender.Notify(ctx, ch, msgID, verdict, text); err != nil {
 		if ctx.Err() != nil {
 			return OutcomeError, ctx.Err()
@@ -142,4 +171,15 @@ func (p *Processor) Process(
 // is loaded, since the store and the cursor live in the same file.
 func (p *Processor) SetSeen(s Seen) {
 	p.seen = s
+}
+
+// excerpt shortens post text for calibration logs, counting runes so Cyrillic
+// is not cut mid-character.
+func excerpt(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }

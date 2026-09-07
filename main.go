@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/joho/godotenv"
@@ -22,6 +23,11 @@ func main() {
 		"poll every source channel once and exit (used by the scheduled deploy)")
 	doctor := flag.Bool("doctor", false,
 		"run preflight checks (api key, account, channels, destination) and exit")
+	dryRun := flag.Bool("dry-run", false,
+		"with -once: classify and log every post but send nothing (calibration)")
+	folders := flag.String("folders", "",
+		"list the account's chat folders and the channel ids in them, then exit; "+
+			"pass a folder name to print just that one (use -folders=all for every folder)")
 	doctorSend := flag.Bool("doctor-send", false,
 		"with -doctor: also send a test message to DESTINATION to prove write access")
 	flag.Parse()
@@ -43,10 +49,16 @@ func main() {
 
 	var err error
 	switch {
+	case *folders != "":
+		name := *folders
+		if strings.EqualFold(name, "all") {
+			name = ""
+		}
+		err = app.Folders(ctx, log, name)
 	case *doctor:
 		err = app.Doctor(ctx, log, *doctorSend)
 	case *once:
-		err = app.RunOnce(ctx, log)
+		err = app.RunOnce(ctx, log, *dryRun)
 	default:
 		err = app.Run(ctx, log)
 	}
