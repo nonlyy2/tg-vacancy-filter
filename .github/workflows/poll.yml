@@ -1,0 +1,73 @@
+name: poll
+
+on:
+  schedule:
+    # Every 30 minutes. Cron on GitHub is best-effort and can be delayed under
+    # load — the message cursor in state.json makes a skipped run harmless.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# Only schedule and manual triggers: a pull_request trigger would expose the
+# Telegram session secret to anyone who opens a PR against this public repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        run: go build -o bot .
+
+      - name: Poll channels
+        env:
+          TG_APP_ID: ${{ secrets.TG_APP_ID }}
+          TG_APP_HASH: ${{ secrets.TG_APP_HASH }}
+          TG_PHONE: ${{ secrets.TG_PHONE }}
+          TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SOURCE_CHANNEL_IDS: ${{ secrets.SOURCE_CHANNEL_IDS }}
+          DESTINATION: ${{ secrets.DESTINATION }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK }}
+          MATCH_THRESHOLD: ${{ vars.MATCH_THRESHOLD }}
+          # First run of a channel sweeps back to this date; afterwards the
+          # cursor in state.json takes over.
+          POLL_BOOTSTRAP_SINCE: "2026-08-24"
+          # Stay well inside timeout-minutes. A long backlog is consumed
+          # across several scheduled runs instead of one oversized job.
+          POLL_MAX_RUNTIME: "18m"
+          # matches.jsonl holds the full text of source posts — keep it out of
+          # a public repository.
+          MATCH_LOG_PATH: ""
+          LOG_LEVEL: info
+        run: ./bot --once
+
+      - name: Persist poll cursor
+        # Runs even when the poll step failed: partial progress is still worth
+        # keeping, and the commit is what keeps the schedule from being
+        # disabled after 60 days of repository inactivity.
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain state.json)" ]; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: update poll cursor"
+          git pull --rebase --autostash
+          git push

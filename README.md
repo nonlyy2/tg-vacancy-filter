@@ -1,57 +1,51 @@
 # tg-vacancy-filter
 
-A small Telegram **userbot** written in Go that watches a list of job channels,
-asks **Gemini / Gemma** whether each post fits a fixed candidate profile
-(Junior / Intern Go · remote or Astana), and forwards the matches to a
-destination chat of your choice.
+A Telegram **userbot** in Go that watches job channels, scores every post
+against a candidate profile with Gemini, and delivers the matches — with the
+score and the model's reasoning — to a chat of your choice.
 
 - **MTProto client:** [`github.com/gotd/td`](https://github.com/gotd/td)
-- **AI filter:** [`github.com/google/generative-ai-go/genai`](https://github.com/google/generative-ai-go) — supports both Gemini (structured JSON) and Gemma (text format) families
+- **Model:** [`github.com/google/generative-ai-go/genai`](https://github.com/google/generative-ai-go)
 - **Config:** [`github.com/joho/godotenv`](https://github.com/joho/godotenv)
 
-The default model is **`gemma-4-26b-a4b-it`** because, as of May 2026, it is
-the only free-tier model with a daily quota (≈14 400 RPD) large enough to
-backfill a multi-week sweep over 20+ channels in one go. Switch
-`GEMINI_MODEL` to a Gemini variant for stricter outputs at the cost of
-tighter daily caps — see [Model selection](#model-selection).
+It runs unattended: no terminal, no laptop left open. The shipped GitHub
+Actions workflow polls every 30 minutes on the free tier.
 
 ---
 
 ## How it works
 
 ```
-Telegram update ──▶ dispatcher ──▶ is source channel? ──▶ analyser ──▶ Gemini family ─▶ JSON via ResponseSchema
-                                                                  │
-                                                                  └─▶ Gemma  family ─▶ "MATCH: yes/no \n REASON: ..." text
-                                                          match=true │
-                                                                     ▼
-                                                              destination chat
-                                                                     +
-                                                              matches.jsonl
+                 ┌─ prefilter ─┐        ┌─ score ≥ threshold ─┐
+poll / update ──▶│ is it a     │──▶ LLM │ and remote != office│──▶ destination chat
+                 │ vacancy?    │        └─────────────────────┘         +
+                 │ seen before?│                                    matches.jsonl
+                 └─────────────┘
 ```
 
-1. `gotd` streams channel updates into an `UpdateDispatcher`.
-2. Posts from channels not in `SOURCE_CHANNEL_IDS` are dropped.
-3. Each remaining post is sent to the configured model:
-   - **Gemini family** (`gemini-*`): the SDK enforces a strict JSON schema
-     `{"match": bool, "reason": string}` via `ResponseSchema`.
-   - **Gemma family** (`gemma-*`): Gemma rejects `SystemInstruction` and
-     `ResponseSchema` at the API layer, so the analyser inlines the prompt
-     and asks for a two-line text reply (`MATCH: yes\nREASON: ...`),
-     parsed with a regex. JSON would be ideal, but Gemma 4 has a tendency
-     to literally echo `{"match": boolean, "reason": string}` on short or
-     ambiguous posts — switching to plain text eliminates that failure mode.
-4. Calls are throttled by an in-process token-bucket limiter
-   (`golang.org/x/time/rate`) configured from `GEMINI_RPM`. Both the
-   live and backfill paths share one limiter, so an in-flight backfill
-   naturally slows live posts instead of pushing you over quota.
-5. If `match == true`, the bot:
-   - appends a record to `MATCH_LOG_PATH` (defaults to `matches.jsonl`),
-   - sends a notification to `DESTINATION` with the reason and a `t.me/...`
-     link to the original post.
-6. **History backfill (optional):** on boot, if `BACKFILL_SINCE` is set, the
-   bot pages `messages.getHistory` for every source channel and replays
-   posts from that date through the same pipeline before going live.
+1. Posts are read either by polling (`--once`) or from live MTProto updates.
+2. **Prefilter** (`internal/filter`) drops anything too short, anything with no
+   hiring vocabulary, and any post whose normalised-text fingerprint was
+   already analysed. Cross-posting means one vacancy typically appears in
+   several channels; only the first copy costs a model call.
+3. The surviving post goes to the model together with the **candidate profile**
+   read from `PROFILE_PATH`. The model returns a structured verdict:
+
+   ```json
+   {"score": 82, "role": "Junior Python Backend", "stack": ["FastAPI", "PostgreSQL"],
+    "seniority": "Junior", "remote": "remote", "location": "Worldwide",
+    "summary": "…", "pros": ["…"], "cons": ["…"]}
+   ```
+
+   Gemini-family models get this enforced server-side via `ResponseSchema`;
+   Gemma models are asked for the same JSON in prose and parsed with a brace
+   scanner.
+4. A post is forwarded when `score >= MATCH_THRESHOLD` **and** `remote` is not
+   `onsite`/`hybrid`. The remote rule lives in code, not in the prompt — a
+   borderline post cannot talk the model out of a hard constraint.
+5. Matches are appended to `MATCH_LOG_PATH` and sent to `DESTINATION`.
+
+**Tuning the filter is editing `profile/candidate.md`.** No Go code involved.
 
 ---
 
@@ -59,423 +53,278 @@ Telegram update ──▶ dispatcher ──▶ is source channel? ──▶ anal
 
 ```
 tg-vacancy-filter/
-├── main.go                     # entrypoint, signal handling
+├── main.go                       # flags: --once, --doctor, --doctor-send
+├── profile/candidate.md          # who the vacancies are for — edit this
 ├── internal/
-│   ├── app/         app.go     # wiring: config + client + dispatcher + analyser
-│   ├── config/      config.go  # env parsing, validation, session base64 restore
-│   ├── gemini/      analyzer.go# rate-limited model client; JSON or text output
+│   ├── app/
+│   │   ├── app.go                # wiring; live mode and poll mode
+│   │   └── doctor.go             # preflight report
+│   ├── config/    config.go      # env parsing and validation
+│   ├── filter/    prefilter.go   # non-vacancy drop + repost fingerprint
+│   ├── gemini/    analyzer.go    # scoring, response schema, quota failover
 │   └── telegram/
-│       ├── auth.go             # terminal-based login (code / 2FA)
-│       ├── backfill.go         # messages.getHistory sweep + persistent state
-│       ├── dialogs.go          # resolve channel access hashes via getDialogs
-│       ├── handler.go          # update -> filter -> notify
-│       ├── history.go          # paginated getHistory with date cutoff
-│       ├── invite.go           # t.me/+xxx invite link resolver
-│       ├── matchlog.go         # append-only JSONL audit trail of matches
-│       └── sender.go           # composes notification, builds post links
-├── Dockerfile
-├── .env.example
-└── .gitignore
+│       ├── auth.go               # interactive login (refuses to hang without a tty)
+│       ├── session.go            # session source: file / string / base64
+│       ├── dialogs.go            # paginated channel resolution
+│       ├── history.go            # getHistory by date or by cursor
+│       ├── poller.go             # --once: cursor, bootstrap sweep, time budget
+│       ├── process.go            # shared post pipeline
+│       ├── handler.go            # live update path
+│       ├── invite.go             # t.me/+xxx invite resolver
+│       ├── matchlog.go           # JSONL audit trail
+│       └── sender.go             # notification format, pacing, FLOOD_WAIT
+└── .github/workflows/poll.yml    # the free scheduled deploy
 ```
 
-Generated runtime files — **all gitignored**:
+Generated runtime files:
 
-| File                      | Purpose                                                   |
-| ------------------------- | --------------------------------------------------------- |
-| `session.json`            | MTProto session — full account access, treat as a secret. |
-| `backfill_state.json`     | Resume cursor for the history sweep.                      |
-| `matches.jsonl`           | Append-only log of every `match=true` verdict.            |
+| File            | Committed | Purpose                                                  |
+| --------------- | :-------: | -------------------------------------------------------- |
+| `state.json`    |    yes    | Poll cursor per channel + fingerprints of analysed posts. |
+| `session.json`  |    no     | MTProto session — full account access, treat as a secret. |
+| `matches.jsonl` |    no     | Every match; contains the text of source posts.           |
 
 ---
 
 ## Prerequisites
 
-1. **Telegram API credentials.** Go to <https://my.telegram.org/apps> and create
-   an app — keep the `api_id` and `api_hash`.
-2. **Gemini API key.** Generate at <https://aistudio.google.com/apikey>.
-3. **Channel IDs.** Forward any message from a source channel to
-   [@userinfobot](https://t.me/userinfobot) or [@getidsbot](https://t.me/getidsbot)
-   to read its numeric id (format `-100xxxxxxxxxx`).
-4. **Destination.** Three shapes are supported:
-   - `DESTINATION=me` — matches land in the userbot's **Saved Messages**.
-     Simplest; no channel needed.
-   - `DESTINATION=my_vacancies_feed` — username of a public channel / user
-     the userbot account can reach.
-   - `DESTINATION=https://t.me/+AbCdEf123` — **invite link** of a private
-     channel. On first boot the userbot calls `messages.checkChatInvite`; if
-     it is not yet a member it auto-joins via `messages.importChatInvite`.
-     Legacy `t.me/joinchat/…` links work too.
-5. The userbot account must **already be joined** to every source channel;
-   MTProto only delivers updates for chats the account participates in.
+1. **Telegram API credentials** — <https://my.telegram.org/apps>.
+2. **Gemini API key** — <https://aistudio.google.com/apikey>.
+3. **Channel IDs** — forward a post to [@userinfobot](https://t.me/userinfobot)
+   and read the `-100xxxxxxxxxx` id. The userbot account must **already be a
+   member** of every source channel; MTProto only serves chats you are in.
+4. **A destination.** `me` (Saved Messages), a username, a numeric channel id
+   (`-1001234567890`), or a `t.me/+…` invite link. For a private channel you
+   created yourself there is no username, so use the numeric id — the bot
+   resolves it through the account's own dialog list.
 
 ---
 
-## Quick start (local)
+## Quick start
 
 ```bash
-# 1. Initialise modules (first time only — the repo already ships go.mod).
-go mod tidy
-
-# 2. Copy the example env file and fill it in.
 cp .env.example .env
-$EDITOR .env
+$EDITOR .env            # credentials, channels, destination
+$EDITOR profile/candidate.md
 
-# 3. Run. The first boot prompts for the Telegram login code (and
-#    2FA password if enabled). Subsequent runs reuse session.json.
-go run .
+go build -o bot .
+./bot -doctor           # check everything before the first real run
+./bot -once             # one polling pass
 ```
 
-To build a native binary:
+`-doctor` is the fastest way to find a broken setup. It prints:
+
+```
+=== gemini ===
+  ✓ api key valid — 47 models support generateContent
+  ✓ primary  gemini-2.5-flash-lite
+  ✓ fallback gemma-4-26b-a4b-it
+=== telegram ===
+  session from   TG_STRING_SESSION
+  ✓ signed in as id=123456789 username=@someaccount name="…"
+  ✓ destination "aslkhn" resolved
+=== source channels ===
+  ✓ 1096154976    Dev KZ | Vacancy                    @devkz_jobs
+  ✗ 1431840960    not in this account's dialogs — join the channel first
+  14/16 reachable
+```
+
+Add `-doctor-send` to also post a test message — the only real proof that the
+account can write to the destination.
+
+---
+
+## Modes
+
+| Command         | Behaviour                                                        |
+| --------------- | ---------------------------------------------------------------- |
+| `./bot -once`   | Poll every channel once, then exit. Used by the scheduled deploy. |
+| `./bot`         | Stay connected and react to live updates. For an always-on host.  |
+| `./bot -doctor` | Preflight checks, then exit.                                      |
+
+### The first poll sweeps history
+
+A channel with no cursor in `state.json` is read from `POLL_BOOTSTRAP_SINCE`
+(e.g. `2026-08-24`) rather than from "now", so the first run picks up the
+backlog instead of starting empty. After that the cursor takes over and only
+new posts are fetched.
+
+A two-week backlog across many channels is more work than one scheduled job
+should attempt. `POLL_MAX_RUNTIME` bounds each run: on expiry the cursor is
+saved and the process exits with status 0, so the next scheduled run continues
+where this one stopped. The backlog drains over a few hours with no manual
+step and no failed jobs.
+
+---
+
+## Configuration
+
+Full list with comments in [`.env.example`](./.env.example). The ones that matter:
+
+| Variable                | Required | Default                  | Notes                                                        |
+| ----------------------- | :------: | ------------------------ | ------------------------------------------------------------ |
+| `TG_APP_ID`             |    ✅    |                          | Integer from my.telegram.org.                                 |
+| `TG_APP_HASH`           |    ✅    |                          | 32-char hex string.                                           |
+| `TG_PHONE`              |    ✅    |                          | The account acting as the userbot.                            |
+| `TG_STRING_SESSION`     |          |                          | Telethon StringSession — the unattended-auth path.            |
+| `SOURCE_CHANNEL_IDS`    |    ✅    |                          | Comma-separated; `-100` prefix optional.                      |
+| `DESTINATION`           |    ✅    |                          | `me`, a username, a numeric channel id, or a `t.me/+…` link.   |
+| `GEMINI_API_KEY`        |    ✅    |                          | From Google AI Studio.                                        |
+| `PROFILE_PATH`          |          | `profile/candidate.md`   | The candidate description injected into the prompt.           |
+| `MATCH_THRESHOLD`       |          | `65`                     | Minimum score to forward.                                     |
+| `GEMINI_MODEL`          |          | `gemini-2.5-flash-lite`  | Verify with `-doctor`; the free lineup changes.               |
+| `GEMINI_MODEL_FALLBACK` |          | `gemma-4-26b-a4b-it`     | Takes over when the primary's daily quota runs out.           |
+| `GEMINI_RPM`            |          | `12`                     | Client-side ceiling. `0` disables.                            |
+| `POLL_STATE_PATH`       |          | `state.json`             | Cursor + fingerprints. Must persist between runs.             |
+| `POLL_BOOTSTRAP_SINCE`  |          |                          | `YYYY-MM-DD` UTC; how far back a channel's first poll reaches.|
+| `POLL_MAX_RUNTIME`      |          | `20m`                    | Budget for one `-once` run.                                   |
+| `MATCH_LOG_PATH`        |          | `matches.jsonl`          | Empty disables. Contains source post text.                    |
+| `LOG_LEVEL`             |          | `info`                   | `debug` prints the score of every post, matched or not.       |
+
+### Model selection
+
+Run `./bot -doctor` — it lists the models your key actually serves and flags
+whether your configured names are among them. Google retires free-tier models
+regularly, so a hardcoded recommendation ages badly.
+
+The rule of thumb: a **Gemini-family** model as `GEMINI_MODEL` (the response
+schema is enforced server-side, so verdicts are always parseable), and a
+**Gemma** model as `GEMINI_MODEL_FALLBACK` (much higher requests-per-day, which
+is what lets a long backlog finish after the primary model's cap is hit).
+
+---
+
+## Unattended authentication
+
+The bot never prompts for a login code on a host without a terminal — it fails
+with a clear message instead of hanging forever. Give it a session:
+
+**Telethon StringSession (recommended).** Generate once, locally, with the
+**same `api_id`** the bot uses:
+
+```python
+# pip install telethon
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
+
+with TelegramClient(StringSession(), API_ID, API_HASH) as client:
+    print(client.session.save())
+```
+
+Put the result in `TG_STRING_SESSION`. The api_id must match: a string created
+with a different app can be rejected as `AUTH_KEY_UNREGISTERED`.
+
+**Or a session file.** Run `./bot` once locally, answer the code prompt, and
+either keep `session.json` on a volume or ship it as
+`TG_SESSION_BASE64=$(base64 -i session.json | tr -d '\n')`.
+
+An existing `session.json` always wins over both env vars.
+
+> Treat all three like a password — each grants full access to the account.
+
+---
+
+## Deploy: GitHub Actions (free)
+
+[`.github/workflows/poll.yml`](.github/workflows/poll.yml) runs `./bot -once`
+every 30 minutes. On a **public** repository Actions minutes are unlimited and
+free; on a private one the free allowance is 2000 minutes/month, so widen the
+cron to hourly there.
 
 ```bash
-go build -o bin/bot .
-./bin/bot
+gh secret set TG_APP_ID
+gh secret set TG_APP_HASH
+gh secret set TG_PHONE
+gh secret set TG_STRING_SESSION
+gh secret set GEMINI_API_KEY
+gh secret set SOURCE_CHANNEL_IDS
+gh secret set DESTINATION
+
+# optional, non-secret knobs
+gh variable set GEMINI_MODEL --body "gemini-2.5-flash-lite"
+gh variable set MATCH_THRESHOLD --body "65"
+
+gh workflow run poll.yml     # first run, then watch it
+gh run watch
 ```
 
-Stop with `Ctrl+C` — the process flushes state and closes the MTProto
-connection cleanly.
+Design notes:
 
----
+- **Only `schedule` and `workflow_dispatch` triggers.** A `pull_request`
+  trigger would hand the Telegram session to anyone opening a PR.
+- **`state.json` is committed back** after each run. That is both the cursor
+  persistence and what keeps the schedule alive — GitHub disables scheduled
+  workflows after 60 days without repository activity.
+- **`concurrency: poll`** prevents two runs from fighting over the cursor.
+- **`MATCH_LOG_PATH=""`** in the workflow: `matches.jsonl` contains the full
+  text of source posts and has no business in a public repository.
+- Cron is best-effort; a delayed or skipped run loses nothing, because the
+  cursor decides what is new, not the clock.
 
-## Configuration reference
+### Alternative: always-on VM
 
-All variables live in `.env` (or the host's environment). See
-[`.env.example`](./.env.example) for the full list; the important ones:
-
-| Variable                  | Required | Default                | Notes                                                   |
-| ------------------------- | :------: | ---------------------- | ------------------------------------------------------- |
-| `TG_APP_ID`               |    ✅    |                        | Integer from my.telegram.org.                           |
-| `TG_APP_HASH`             |    ✅    |                        | 32-char hex string.                                     |
-| `TG_PHONE`                |    ✅    |                        | `+7...` — account that acts as the userbot.             |
-| `SOURCE_CHANNEL_IDS`      |    ✅    |                        | Comma-separated; `-100` prefix is optional.             |
-| `DESTINATION`             |    ✅    |                        | `me`, a username, or a `t.me/+...` invite link.         |
-| `GEMINI_API_KEY`          |    ✅    |                        | From Google AI Studio.                                  |
-| `GEMINI_MODEL`            |          | `gemma-4-26b-a4b-it`   | See [Model selection](#model-selection).                |
-| `GEMINI_RPM`              |          | `25`                   | Client-side rate ceiling. `0` disables the limiter.     |
-| `SESSION_PATH`            |          | `session.json`         | Keep secret.                                            |
-| `TG_SESSION_BASE64`       |          |                        | Base64 of `session.json` — see [Deploy](#deploy).       |
-| `MAX_MESSAGE_AGE_SECONDS` |          | `900`                  | Skip live posts older than this at boot.                |
-| `BACKFILL_SINCE`          |          |                        | `YYYY-MM-DD` UTC; one-time history sweep.               |
-| `BACKFILL_STATE_PATH`     |          | `backfill_state.json`  | Resume cursor for backfill.                             |
-| `MATCH_LOG_PATH`          |          | `matches.jsonl`        | Append-only audit log. Empty = disabled.                |
-| `LOG_LEVEL`               |          | `info`                 | `debug` / `info` / `warn` / `error`.                    |
-
----
-
-## Model selection
-
-Free-tier limits per <https://ai.google.dev/gemini-api/docs/rate-limits>.
-**These move around** — Google has cut Gemini Flash RPD twice in 2026 and
-retired `gemma-3-27b-it` from `v1beta` entirely. Numbers below are accurate
-as of **May 2026**; check the page if quota errors look surprising.
-
-| Model                   | Family | Free RPM | Free RPD | Notes                                                   |
-| ----------------------- | :----: | :------: | :------: | ------------------------------------------------------- |
-| `gemma-4-26b-a4b-it`    | Gemma  |   30     |  14 400  | **Default.** Big enough RPD for multi-week backfills.   |
-| `gemini-2.5-flash-lite` | Gemini |   15     |   ~1000  | Stricter JSON via ResponseSchema. Good for live-only.   |
-| `gemini-2.5-flash`      | Gemini |    5     |    250   | Smarter, but quota too small for backfill.              |
-
-**How to choose:**
-
-- **Backfill across weeks of history?** Stay on Gemma. ~7000 messages
-  through 20 channels can easily exceed 1000 model calls; only Gemma's
-  14 400 RPD survives.
-- **Live-only, no backfill?** Either family is fine. Gemini gives stricter
-  output and slightly better edge-case judgement; Gemma is faster.
-- **Paid tier?** Set `GEMINI_RPM=0` and pick whichever model you prefer —
-  the limiter is the only RPM gate; quota becomes a billing question, not
-  a runtime one.
-
-The analyser detects the family from the model name prefix (`gemma*` vs
-everything else) and switches output format automatically — no other code
-changes are required to swap models.
-
-Recommended `GEMINI_RPM` values:
-
-| Plan                | Model                   | `GEMINI_RPM` |
-| ------------------- | ----------------------- | ------------ |
-| Free                | `gemma-4-26b-a4b-it`    | `25`         |
-| Free                | `gemini-2.5-flash-lite` | `12`         |
-| Free                | `gemini-2.5-flash`      | `4`          |
-| Paid, low traffic   | any                     | `60`         |
-| Paid, high traffic  | any                     | `0` (off)    |
-
-Why not run at the quota ceiling? Google's accounting is slightly bursty
-near the edge — keeping one spare request per minute smooths out
-transient 429s, and the built-in retry handles the rest.
-
----
-
-## History backfill
-
-Live listening only covers posts that arrive **while the bot is running** —
-Telegram does not replay weeks of updates to a reconnecting client. To catch
-up on a historical window, set `BACKFILL_SINCE` to the earliest date you
-care about:
-
-```env
-BACKFILL_SINCE=2026-04-17
-```
-
-On the next boot the bot will:
-
-1. Resolve source-channel access hashes from the account's dialogs
-   (`messages.getDialogs`).
-2. For each channel, page `messages.getHistory` backwards until it reaches
-   `BACKFILL_SINCE` or an ID it has already processed.
-3. Replay the posts (oldest → newest) through the analyser, honouring
-   `GEMINI_RPM`.
-4. Append matches to `MATCH_LOG_PATH` and forward them to `DESTINATION`
-   exactly like live posts.
-5. Persist progress to `BACKFILL_STATE_PATH` every 10 analyses, so a crash
-   resumes where it left off.
-
-**Idempotency.** Leaving `BACKFILL_SINCE` set after a successful run is
-safe: subsequent boots see `state.done = true` for that date and skip
-immediately. To trigger a fresh sweep, **change the date** — the state
-file's `since` field is part of the key, so a different date invalidates
-the old cursor and starts over.
-
-**Resuming a window.** If you previously backfilled `2026-04-01 → 2026-04-16`
-and want to extend through today, set `BACKFILL_SINCE=2026-04-17` (one day
-**after** the previous boot timestamp). Using `2026-04-16` would re-analyse
-posts from the morning of the 16th that were already classified — at best
-duplicate Gemini calls, at worst duplicate match notifications.
-
-**Stateless hosts.** Without a persistent volume, `backfill_state.json`
-disappears on redeploy and the sweep runs again. Either mount a volume for
-`BACKFILL_STATE_PATH` or clear `BACKFILL_SINCE` once the first run finishes.
-
----
-
-## Match log (`matches.jsonl`)
-
-Every `match=true` verdict is appended as one JSON object per line:
-
-```jsonl
-{"ts":"2026-05-07T12:34:56Z","channel":"IT Jobs","channel_id":1944996511,"msg_id":348,"reason":"Junior Go разработчик, удалёнка","link":"https://t.me/c/1944996511/348","source":"backfill"}
-```
-
-This is a persistent audit trail independent of the Telegram send. If the
-destination chat is later cleared, or a single send fails, the verdict is
-not lost. Set `MATCH_LOG_PATH=` (empty) to disable. The file is
-**gitignored** — it contains private post text by way of the `reason`
-field.
-
----
-
-## Rate limiting & retries
-
-The analyser wraps every `GenerateContent` call with a token-bucket limiter
-configured from `GEMINI_RPM`, plus transparent retry-on-429 that honours
-the `retry in Xs` hint the API returns.
-
-- Limiter: `rate.NewLimiter(rate.Every(60s/RPM), burst=1)`.
-- Up to **3 retries** on `RESOURCE_EXHAUSTED` / 429, with the
-  server-supplied wait time + 1s safety margin. Falls back to
-  exponential `10s · 2^attempt` if no `retry in Xs` hint is present.
-- A single channel error never aborts the whole backfill — the channel
-  is logged and the next one starts.
-
-Set `LOG_LEVEL=debug` to see every per-message verdict (including
-non-matches) and any retry sleeps.
-
----
-
-## Deploy
-
-The shipped **Dockerfile** runs unchanged on any Docker-capable host.
-The tricky bit everywhere is **persisting `session.json` and
-`backfill_state.json`** — lose the session and the account has to
-re-authenticate via SMS / 2FA on every cold boot; lose the backfill
-state and your configured `BACKFILL_SINCE` may run again.
-
-> ⚠️ **There is no truly free always-on PaaS in 2026.**
-> Render removed its free Background Worker tier in 2024. Fly.io moved
-> to pay-as-you-go (no persistent free allowance) in Oct 2024. Railway
-> gives a one-time $5 trial then requires $5/mo. Koyeb's free web
-> services sleep.
-> For a genuinely free, always-on deploy, rent a free-tier VM:
-> **Oracle Cloud Always Free** (recommended) or **Google Cloud `e2-micro`**.
-
-### Oracle Cloud Always Free (recommended)
-
-Oracle's Always-Free tier includes either 2 AMD `VM.Standard.E2.1.Micro`
-instances (1/8 OCPU, 1 GB RAM each) **or** an ARM Ampere A1 instance with
-up to 4 OCPU and 24 GB RAM. All permanent, no 12-month cliff. One-time
-signup requires a credit card for verification — no charges.
+For real-time delivery instead of 30-minute batches, run the live mode on any
+small host — **Oracle Cloud Always Free** (ARM Ampere, permanent, card needed
+for signup) or **Google Cloud `e2-micro`**:
 
 ```bash
-# 1. Sign up at https://signup.cloud.oracle.com (pick a home region you'll
-#    keep forever; you can't change it later). Wait for the account to
-#    be approved (usually minutes).
-#
-# 2. In the console: Compute -> Instances -> Create Instance
-#    - Shape:  "Ampere" (ARM, 1 OCPU, 6 GB RAM) is plenty, and easiest to get.
-#              If ARM is out of capacity in your region, pick "AMD E2.1.Micro".
-#    - Image:  Ubuntu 22.04 or 24.04 (Always Free eligible)
-#    - Network: accept defaults; note the public IPv4.
-#    - SSH:    upload your ~/.ssh/id_ed25519.pub (or generate one).
-#
-# 3. SSH in and install Docker:
-ssh ubuntu@<public-ip>
-sudo apt update && sudo apt install -y docker.io git
-sudo usermod -aG docker ubuntu && exec sudo -u ubuntu -i   # re-login for group
-
-# 4. Clone & build the image.
-git clone https://github.com/<you>/tg-vacancy-filter.git
-cd tg-vacancy-filter
 docker build -t tg-vacancy-filter .
-
-# 5. Create a host directory for session + backfill state (survives restarts).
-mkdir -p ~/bot-data
-
-# 6. First run — attach stdin/tty to enter the Telegram login code.
-docker run --rm -it \
+docker run -d --name tg-bot --restart unless-stopped \
   -v ~/bot-data:/data \
   -e SESSION_PATH=/data/session.json \
-  -e BACKFILL_STATE_PATH=/data/backfill_state.json \
-  -e MATCH_LOG_PATH=/data/matches.jsonl \
-  --env-file <(cat <<'EOF'
-TG_APP_ID=...
-TG_APP_HASH=...
-TG_PHONE=+7...
-SOURCE_CHANNEL_IDS=-1001111,-1002222
-DESTINATION=https://t.me/+AbCdEf
-GEMINI_API_KEY=AIza...
-GEMINI_MODEL=gemma-4-26b-a4b-it
-GEMINI_RPM=25
-EOF
-) tg-vacancy-filter
-# Enter the code when prompted. Once you see "listening for channel posts",
-# stop with Ctrl+C. session.json is now in ~/bot-data.
-
-# 7. Run it detached with auto-restart. Use the same env-file.
-docker run -d --name tg-bot \
-  --restart unless-stopped \
-  -v ~/bot-data:/data \
-  -e SESSION_PATH=/data/session.json \
-  -e BACKFILL_STATE_PATH=/data/backfill_state.json \
+  -e POLL_STATE_PATH=/data/state.json \
   -e MATCH_LOG_PATH=/data/matches.jsonl \
   --env-file ~/bot.env \
   tg-vacancy-filter
-
-docker logs -f tg-bot    # should show "logged in" and "listening for channel posts"
 ```
 
-To trigger a backfill later:
+The bot only makes outbound calls, so no ingress rules are needed.
 
-```bash
-# edit ~/bot.env, add BACKFILL_SINCE=2026-04-17
-docker restart tg-bot
-docker logs -f tg-bot    # wait for "backfill: complete"
-```
+---
 
-**Firewall.** Oracle's default VCN blocks inbound, but the bot only makes
-outbound calls to Telegram and Gemini, so no ingress rules are needed.
+## Rate limiting, retries and quota
 
-**Staying always-free.** Oracle used to reclaim idle Always-Free
-instances — that policy was removed in 2024, but to be safe, pick a real
-workload (this bot) and keep it running. CPU usage of the bot sits near
-zero, so you'll never hit throttling.
+- A token-bucket limiter (`GEMINI_RPM`) paces every model call.
+- Up to 3 retries on `RESOURCE_EXHAUSTED`, honouring the server's
+  `retry in Xs` hint, else exponential backoff from 10s.
+- When those are exhausted the analyser switches to `GEMINI_MODEL_FALLBACK`
+  once per process and logs a warning. This is what lets a bootstrap sweep
+  finish after the primary model's daily cap.
+- Notifications are paced 1.5s apart and retried once on `FLOOD_WAIT` — a
+  bootstrap can produce dozens of matches back to back.
+- A channel that fails to fetch is logged and skipped; the run continues.
 
-### Alternative: Google Cloud `e2-micro` (Always Free)
-
-Similar idea: one `e2-micro` VM in `us-west1`, `us-central1`, or
-`us-east1` is free forever (1 per account, 30 GB disk). Same Docker-based
-setup as Oracle. Requires a credit card but no charges within the free
-envelope.
-
-### Railway ($5/mo starter credit)
-
-1. `railway login` && `railway init` (pick "Empty Project").
-2. `railway up` or connect the repo through the web UI — Railway
-   auto-detects the Dockerfile.
-3. Add a **Volume** in the service settings mounted at `/data`. Set
-   `SESSION_PATH=/data/session.json`, `BACKFILL_STATE_PATH=/data/backfill_state.json`,
-   `MATCH_LOG_PATH=/data/matches.jsonl`.
-4. Paste the remaining `.env` contents into the **Variables** tab.
-5. Railway containers have no stdin, so authenticate locally first and
-   upload `session.json` into the volume — or use `TG_SESSION_BASE64`.
-
-### Render (paid — Background Worker starts at $7/mo)
-
-1. New → **Background Worker** → connect GitHub → select the repo.
-2. Environment: **Docker**. Leave build / start commands empty — the
-   Dockerfile's `ENTRYPOINT` is enough.
-3. Attach a **Disk** (Settings → Disks) mounted at `/data`, 1 GB is plenty.
-   Same env vars as Railway above.
-4. Paste the `.env` contents into **Environment → Environment Variables**.
-5. Same stdin caveat: authenticate locally, upload session, or use
-   `TG_SESSION_BASE64`.
-
-### Base64 session (no volume, cheapest tier — works anywhere)
-
-1. Authenticate **once locally**:
-
-   ```bash
-   cp .env.example .env
-   $EDITOR .env                          # fill everything
-   go run .                              # enter code + 2FA when prompted
-   # session.json is now on disk
-   ```
-
-2. Encode the session:
-
-   ```bash
-   base64 -i session.json | tr -d '\n' > session.b64
-   ```
-
-3. Set the env var `TG_SESSION_BASE64` to the contents of `session.b64` on
-   the host. On boot the bot materialises the file at `SESSION_PATH`
-   **only if one doesn't already exist**, so a mounted volume still wins.
-   ⚠️ Without a volume, `BACKFILL_STATE_PATH` and `MATCH_LOG_PATH` are
-   also ephemeral — clear `BACKFILL_SINCE` after a successful run, or the
-   sweep will repeat on every redeploy.
-
-4. Treat `session.b64` like a password — anyone with it can read your
-   Telegram account.
-
-> If Telegram invalidates the session (forced re-login from another device,
-> password change, etc.), repeat the two steps locally and update the
-> env var.
-
-### Health & logs
-
-- The process writes structured logs (`slog` text handler) to **stderr**.
-- Railway / Render stream stderr into the web console; set
-  `LOG_LEVEL=debug` temporarily to see per-message decisions.
+`LOG_LEVEL=debug` prints the score and reasoning for every post, including
+rejected ones. That is the tool for calibrating `MATCH_THRESHOLD` and the
+profile.
 
 ---
 
 ## Security notes
 
-- `session.json` grants **full access** to the Telegram account. Never
-  commit it, never paste it into screenshots, and rotate by logging out
-  from "Active sessions" if you suspect a leak.
-- `matches.jsonl` contains private post text from source channels. Keep
-  it out of git (it already is) and out of any logs you share.
-- Userbots are allowed by Telegram but **abusing the API** (flooding,
-  mass DMs, scraping) can get the account banned. This bot is pull-only
-  and safe in typical use.
-- Model calls include the post text. Don't point the bot at private
-  employer-only channels whose content you're not allowed to share with a
-  third-party model.
+- `session.json` and `TG_STRING_SESSION` grant **full access** to the Telegram
+  account. Never commit them; rotate via "Active sessions" if leaked.
+- `matches.jsonl` contains private post text — gitignored, keep it that way.
+- `profile/candidate.md` is committed. Keep phone numbers and email addresses
+  out of it.
+- Userbots are permitted, but abusing the API (flooding, mass DMs, scraping)
+  can get an account banned. This bot is pull-only and paced.
+- Model calls include the post text. Don't point it at channels whose content
+  you are not allowed to share with a third party.
 
 ---
 
 ## Troubleshooting
 
-| Symptom                                                | Fix                                                                                                                  |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| `models/<x> is not found for API version v1beta`       | Google retired the model. Switch `GEMINI_MODEL` to one listed in [Model selection](#model-selection).                |
-| `gemini: decode "{ \"match\": boolean ... }"`          | Old prompt + a Gemma model echoing the JSON template. Update the binary — the current Gemma path uses text format.   |
-| `gemini: no MATCH line in response`                    | Gemma didn't follow the two-line format on a borderline post. Verdict is dropped, post is skipped on this run only.  |
-| `AUTH_KEY_UNREGISTERED` on boot                        | Session revoked — delete `session.json` and re-authenticate.                                                         |
-| `PHONE_CODE_INVALID`                                   | The code arrives via **Telegram app**, not SMS — check Saved Messages.                                               |
-| Nothing happens for a known post                       | Account must be joined to the channel; also check `MAX_MESSAGE_AGE_SECONDS`.                                         |
-| `resolve destination ...: USERNAME_NOT_OCCUPIED`       | Channel username is wrong or the account cannot see it. Prefer `DESTINATION=me`.                                     |
-| `INVITE_HASH_EXPIRED` / `INVITE_HASH_INVALID`          | Regenerate the invite link in the channel settings and update `.env`.                                                |
-| RESOURCE_EXHAUSTED bursts                              | Drop `GEMINI_RPM` by 5 or wait for the daily reset (UTC midnight). The retry handler covers transient 429s for free. |
-
-Enjoy the cleaner inbox.
+| Symptom                                                       | Fix                                                                                              |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `API key not valid`                                           | Key revoked or from the wrong project. Issue a new one; `-doctor` confirms it.                    |
+| `models/<x> is not found for API version v1beta`              | Google retired the model. `-doctor` lists what your key actually serves.                          |
+| `telegram session missing and stdin is not a terminal`        | Working as intended: set `TG_STRING_SESSION`, or authenticate locally once.                       |
+| `AUTH_KEY_UNREGISTERED` on boot                               | Session revoked, or the string session was made with a different `api_id`. Regenerate it.         |
+| `PHONE_CODE_INVALID`                                          | The code arrives in the **Telegram app**, not by SMS — check Saved Messages.                       |
+| Channel listed as "not in this account's dialogs"             | The signed-in account is not a member. Join it, then re-run `-doctor`.                             |
+| No matches at all                                             | `LOG_LEVEL=debug` and read the scores. Usually the profile is too strict or the threshold too high.|
+| Too many irrelevant matches                                   | Raise `MATCH_THRESHOLD`, or add the unwanted role to the "не подходит" list in the profile.        |
+| `RESOURCE_EXHAUSTED` bursts                                   | Lower `GEMINI_RPM`, or wait for the UTC-midnight reset. The fallback model covers most of it.      |
+| Scheduled workflow stopped running                            | GitHub disables cron after 60 days of inactivity. The state commit normally prevents this.         |

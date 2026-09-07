@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.6
 
 # ---- build stage ------------------------------------------------------------
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -23,9 +23,13 @@ RUN apk add --no-cache ca-certificates tzdata && \
 
 WORKDIR /app
 COPY --from=build /out/bot /app/bot
+# The prompt reads the candidate profile at runtime.
+COPY profile/ /app/profile/
 
 # The session file will be written next to the binary by default.
-# Mount a persistent volume to /app if you want the session to survive restarts.
+# Mount a persistent volume to /app if you want the session and the poll
+# cursor to survive restarts, or pass TG_STRING_SESSION instead.
 USER app
 
+# No flags: long-running live mode. Append "--once" for a single poll pass.
 ENTRYPOINT ["/app/bot"]

@@ -7,14 +7,16 @@ session.json
 session.b64
 *.b64
 
-# --- runtime / state (per-deploy, don't commit) ---
-backfill_state.json
-backfill_state.*.json
+# --- runtime / state ---
+# state.json is deliberately NOT ignored: the scheduled workflow commits it
+# back so the poll cursor survives between runs.
+state.json.tmp
 matches.jsonl
 matches.*.jsonl
 
 # --- build artifacts ---
 /bin/
+/bot
 /tmp/
 /dist/
 *.log
@@ -32,3 +34,6 @@ Thumbs.db
 
 # --- Go module cache (only meaningful when vendoring) ---
 /vendor/
+
+CLAUDE.md
+/private/
