@@ -198,16 +198,7 @@ func (p *Poller) pass(
 		return false, p.saveState(state)
 	}
 
-	// Group by channel: a channel's posts must be analysed in ID order so the
-	// cursor only ever moves over work that is actually done. Channels are
-	// independent, so they run in parallel.
-	byChannel := make(map[int64][]pendingPost, len(sources))
-	for _, post := range pending {
-		byChannel[post.channelID] = append(byChannel[post.channelID], post)
-	}
-	for _, posts := range byChannel {
-		sort.Slice(posts, func(i, j int) bool { return posts[i].msg.ID < posts[j].msg.ID })
-	}
+	byChannel := groupByChannel(pending)
 	p.log.Info("poll: analysing",
 		slog.Int("pending", len(pending)),
 		slog.Int("channels", len(byChannel)),
@@ -250,8 +241,18 @@ func (p *Poller) pass(
 					return
 				}
 
-				outcome, err := p.proc.Process(ctx, post.channel, post.msg.ID,
-					strings.TrimSpace(post.msg.Message), "poll")
+				text := strings.TrimSpace(post.msg.Message)
+				if text == "" {
+					// Media without a caption carries nothing to classify.
+					mu.Lock()
+					counts[OutcomeSkipped]++
+					state.advance(id, post.msg.ID)
+					processed++
+					mu.Unlock()
+					continue
+				}
+
+				outcome, err := p.proc.Process(ctx, post.channel, post.msg.ID, text, "poll")
 
 				mu.Lock()
 				if err != nil {
@@ -343,13 +344,12 @@ func (p *Poller) collect(
 			continue
 		}
 
+		// Every message goes into the queue, captionless media included. The
+		// cursor must only ever move over posts the worker has actually
+		// reached, in ID order — advancing here would jump it past pending
+		// posts whenever a newer one happens to carry no text, and those
+		// posts would never be fetched again.
 		for _, m := range msgs {
-			if strings.TrimSpace(m.Message) == "" {
-				// Media without a caption carries nothing to classify, but the
-				// cursor must still move past it.
-				state.advance(id, m.ID)
-				continue
-			}
 			pending = append(pending, pendingPost{channelID: id, channel: resolved.Channel, msg: m})
 		}
 
@@ -404,4 +404,19 @@ func sortedIDs(sources map[int64]ResolvedChannel) []int64 {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
+}
+
+// groupByChannel buckets the queue per channel in ascending message ID order.
+// The order is what makes the cursor safe: a channel's cursor may only move
+// over posts the worker has already passed, so anything still queued must have
+// a higher ID than anything completed.
+func groupByChannel(pending []pendingPost) map[int64][]pendingPost {
+	byChannel := make(map[int64][]pendingPost)
+	for _, post := range pending {
+		byChannel[post.channelID] = append(byChannel[post.channelID], post)
+	}
+	for _, posts := range byChannel {
+		sort.Slice(posts, func(i, j int) bool { return posts[i].msg.ID < posts[j].msg.ID })
+	}
+	return byChannel
 }
